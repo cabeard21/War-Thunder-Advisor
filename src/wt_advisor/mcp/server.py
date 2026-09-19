@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from wt_advisor.domain.models import GameMode, Nation, VehicleStatus
 from wt_advisor.services.advisor import AdvisorService
@@ -27,8 +28,30 @@ MUTATION = ToolAnnotations(
 )
 
 
-def _dump(value: BaseModel) -> dict[str, Any]:
-    return value.model_dump(mode="json")
+BR_TENTHS_DESCRIPTION = (
+    "Battle rating in integer tenths: 10 = 1.0, 23 = 2.3, "
+    "27 = 2.7, and 40 = 4.0."
+)
+BR_EXAMPLES = [10, 23, 27, 40]
+
+
+def _jsonable(value: Any) -> Any:
+    """Serialize immutable service DTOs consistently at the MCP boundary."""
+
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list, set, frozenset)):
+        return [_jsonable(item) for item in value]
+    return value
+
+
+def _dump(value: Any) -> dict[str, Any]:
+    payload = _jsonable(value)
+    if not isinstance(payload, dict):
+        raise TypeError("expected a structured object result")
+    return payload
 
 
 def create_server(service: AdvisorService) -> MCPServer[Any]:
@@ -43,13 +66,16 @@ def create_server(service: AdvisorService) -> MCPServer[Any]:
     def get_data_status() -> dict[str, Any]:
         """Return active evidence snapshots and schema/rules revisions."""
 
-        return service.data_status()
+        return _dump(service.data_status())
 
     @server.tool(annotations=READ_ONLY, structured_output=True)
     def list_vehicles(
         nation: Nation = Nation.USA,
         mode: GameMode = GameMode.GROUND_REALISTIC,
-        max_br: int | None = None,
+        max_br: Annotated[
+            int | None,
+            Field(description=BR_TENTHS_DESCRIPTION, examples=BR_EXAMPLES),
+        ] = None,
     ) -> list[dict[str, Any]]:
         """List resolved vehicles and provenance; BR values are integer tenths."""
 
@@ -100,7 +126,10 @@ def create_server(service: AdvisorService) -> MCPServer[Any]:
     @server.tool(annotations=READ_ONLY, structured_output=True)
     def generate_lineups(
         profile_id: str = "acceptance",
-        target_br: int | None = None,
+        target_br: Annotated[
+            int | None,
+            Field(description=BR_TENTHS_DESCRIPTION, examples=BR_EXAMPLES),
+        ] = None,
         top_n: int = 10,
         hypothetical_owned: list[str] | None = None,
         required_vehicle_id: str | None = None,
@@ -138,7 +167,7 @@ def create_server(service: AdvisorService) -> MCPServer[Any]:
     def evaluate_next_unlocks(profile_id: str = "acceptance") -> dict[str, Any]:
         """Evaluate each directly researchable vehicle as a one-step unlock."""
 
-        return service.evaluate_next_unlocks_status(profile_id)
+        return _dump(service.evaluate_next_unlocks_status(profile_id))
 
     return server
 

@@ -12,10 +12,14 @@ from pydantic import Field, model_validator
 from wt_advisor.domain.models import (
     AvailabilityType,
     Capability,
+    CapabilityObservation,
+    CapabilityResolution,
     DatasetType,
     Freshness,
     FrozenModel,
     Nation,
+    ResearchEdge,
+    ResolvedAvailability,
     SnapshotPurpose,
     SnapshotRef,
     UserProfile,
@@ -90,6 +94,67 @@ class RawStatisticsDataset(FrozenModel):
     snapshot: SnapshotRef
     records: tuple[VehicleStatistics, ...]
     raw_content: bytes = Field(repr=False)
+
+
+class RawCapabilityDataset(FrozenModel):
+    snapshot: SnapshotRef
+    records: tuple[CapabilityObservation, ...]
+    raw_content: bytes = Field(repr=False)
+
+    @model_validator(mode="after")
+    def unique_observations(self) -> RawCapabilityDataset:
+        keys = [
+            (row.vehicle_id, row.capability, row.source_provider, row.source_reference)
+            for row in self.records
+        ]
+        if len(keys) != len(set(keys)):
+            raise ValueError("capability dataset contains duplicate observations")
+        return self
+
+    def resolve(self, vehicle_id: str, capability: Capability | str) -> CapabilityResolution:
+        resolved_capability = Capability(capability)
+        observations = tuple(
+            row
+            for row in self.records
+            if row.vehicle_id == vehicle_id and row.capability is resolved_capability
+        )
+        return CapabilityResolution.from_observations(
+            vehicle_id, resolved_capability, observations
+        )
+
+
+class RawAvailabilityDataset(FrozenModel):
+    snapshot: SnapshotRef
+    records: tuple[ResolvedAvailability, ...]
+    raw_content: bytes = Field(repr=False)
+
+    @model_validator(mode="after")
+    def unique_vehicles(self) -> RawAvailabilityDataset:
+        ids = [row.vehicle_id for row in self.records]
+        if len(ids) != len(set(ids)):
+            raise ValueError("availability dataset contains duplicate vehicle IDs")
+        return self
+
+
+class RawResearchGraphDataset(FrozenModel):
+    snapshot: SnapshotRef
+    records: tuple[ResearchEdge, ...]
+    raw_content: bytes = Field(repr=False)
+
+    @model_validator(mode="after")
+    def unique_edges(self) -> RawResearchGraphDataset:
+        keys = [
+            (
+                row.parent_vehicle_id,
+                row.child_vehicle_id,
+                row.edge_type,
+                row.prerequisite_group,
+            )
+            for row in self.records
+        ]
+        if len(keys) != len(set(keys)):
+            raise ValueError("research graph dataset contains duplicate edges")
+        return self
 
 
 class FixtureUserState(FrozenModel):

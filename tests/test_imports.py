@@ -7,11 +7,16 @@ import httpx
 import pytest
 
 from wt_advisor.data.freshness import FreshnessPolicy, evaluate_freshness
+from wt_advisor.data.imports.availability import import_availability_yaml
+from wt_advisor.data.imports.capabilities import import_capabilities_json
+from wt_advisor.data.imports.research_graph import import_research_graph_json
 from wt_advisor.data.imports.statistics import (
     MAX_IMPORT_BYTES,
     StatisticsImportError,
     import_statistics_csv,
     import_statistics_json,
+    inspect_statistics_csv,
+    inspect_statistics_json,
 )
 from wt_advisor.data.models import RawDatasetMetadata
 from wt_advisor.data.providers.fixture import FixtureProvider
@@ -20,7 +25,13 @@ from wt_advisor.data.providers.wt_vehicles_api import (
     ResponseTooLargeError,
     WarThunderVehiclesApiProvider,
 )
-from wt_advisor.domain.models import DatasetType, Freshness, StatisticsScope
+from wt_advisor.domain.models import (
+    CapabilityState,
+    DatasetType,
+    Freshness,
+    PrerequisiteSemantics,
+    StatisticsScope,
+)
 from wt_advisor.overrides.loader import MAX_OVERRIDE_BYTES, load_overrides
 
 
@@ -126,6 +137,171 @@ def test_csv_statistics_import_requires_explicit_header_and_parses_blanks() -> N
         import_statistics_csv(
             "vehicle_id,mode_scope,score\nus_m22,unknown_realistic_scope,5\n", metadata()
         )
+
+
+def test_statistics_inspect_maps_source_ids_and_reports_duplicates_without_mutation() -> None:
+    payload = json.dumps(
+        [
+            {
+                "source_vehicle_id": "m24-source",
+                "mode_scope": "ground_realistic_ground_vehicles",
+                "sample_start": "2026-08-01",
+                "sample_end": "2026-08-31",
+                "battles": 100,
+                "wins": 55,
+                "kills": 120,
+                "deaths": 80,
+                "kd": 1.5,
+                "kills_per_battle": 1.2,
+            },
+            {
+                "source_vehicle_id": "m24-source",
+                "mode_scope": "ground_realistic_ground_vehicles",
+                "sample_start": "2026-08-01",
+                "sample_end": "2026-08-31",
+                "battles": 100,
+            },
+        ]
+    )
+
+    inspection = inspect_statistics_json(
+        payload,
+        metadata(),
+        identity_aliases={"m24-source": "us_m24"},
+        canonical_vehicle_ids={"us_m24"},
+    )
+
+    assert inspection.matched_rows == 2
+    assert inspection.canonical_match_rate == 1.0
+    assert inspection.duplicate_observations
+    assert inspection.prospective_snapshot_id.startswith("statistics-")
+    assert not inspection.valid
+    with pytest.raises(StatisticsImportError, match="duplicate"):
+        import_statistics_json(
+            payload,
+            metadata(),
+            identity_aliases={"m24-source": "us_m24"},
+            canonical_vehicle_ids={"us_m24"},
+        )
+
+
+def test_statistics_inspect_reports_unknown_columns_and_unresolved_identities() -> None:
+    payload = (
+        "source_vehicle_id,mode_scope,battles,rating\n"
+        "unknown,ground_realistic_ground_vehicles,10,99\n"
+    )
+
+    inspection = inspect_statistics_csv(
+        payload,
+        metadata(),
+        identity_aliases={},
+        canonical_vehicle_ids={"us_m24"},
+    )
+
+    assert inspection.unknown_columns == ("rating",)
+    assert inspection.unresolved_source_ids == ("unknown",)
+    assert not inspection.valid
+
+
+def test_statistics_m2_import_maps_identity_and_preserves_reported_ratios() -> None:
+    payload = json.dumps(
+        [
+            {
+                "source_vehicle_id": "m24-source",
+                "mode_scope": "ground_realistic_ground_vehicles",
+                "battles": 100,
+                "wins": 55,
+                "kills": 120,
+                "deaths": 80,
+                "win_rate": 0.55,
+                "kd": 1.5,
+                "kills_per_battle": 1.2,
+            }
+        ]
+    )
+
+    dataset = import_statistics_json(
+        payload,
+        metadata(),
+        identity_aliases={"m24-source": "us_m24"},
+        canonical_vehicle_ids={"us_m24"},
+    )
+
+    row = dataset.records[0]
+    assert row.vehicle_id == "us_m24"
+    assert row.reported_kd == 1.5
+    assert row.derived_kd == 1.5
+
+
+def test_capability_import_preserves_explicit_false_and_rejects_missing_value() -> None:
+    cap_metadata = metadata(DatasetType.CAPABILITIES)
+    payload = json.dumps(
+        [
+            {
+                "vehicle_id": "us_m24",
+                "capability": "scouting",
+                "value": False,
+                "source_provider": "curated",
+                "source_reference": "reference",
+                "source_type": "official_reference",
+            }
+        ]
+    )
+
+    dataset = import_capabilities_json(payload, cap_metadata)
+
+    assert dataset.resolve("us_m24", "scouting").state is CapabilityState.VERIFIED_ABSENT
+    with pytest.raises(ValueError, match="value"):
+        import_capabilities_json(payload.replace(', "value": false', ""), cap_metadata)
+
+
+def test_availability_yaml_import_is_strict_and_provenance_stamped() -> None:
+    payload = """\
+- vehicle_id: us_m24
+  acquisition_type: research
+  researchability: normally_researchable
+  tree_membership: main_tree
+  visibility: visible
+  source_provider: curated
+  source_reference: reference
+  reason: visible main-tree vehicle
+  provider_observation: research_tree
+"""
+
+    dataset = import_availability_yaml(payload, metadata(DatasetType.AVAILABILITY))
+
+    assert dataset.records[0].vehicle_id == "us_m24"
+    with pytest.raises(ValueError, match="unknown"):
+        import_availability_yaml(payload + "  unknown: true\n", metadata(DatasetType.AVAILABILITY))
+
+
+def test_research_graph_import_supports_all_and_any_prerequisite_groups() -> None:
+    payload = json.dumps(
+        [
+            {
+                "nation": "usa",
+                "domain": "ground",
+                "parent_vehicle_id": "us_m3_lee",
+                "child_vehicle_id": "us_m4a1",
+                "edge_type": "required_predecessor",
+                "prerequisite_group": "entry",
+                "prerequisite_semantics": "all",
+            },
+            {
+                "nation": "usa",
+                "domain": "ground",
+                "parent_vehicle_id": "us_m4",
+                "child_vehicle_id": "us_m24",
+                "edge_type": "branch_unlock",
+                "prerequisite_group": "branch",
+                "prerequisite_semantics": "any",
+            },
+        ]
+    )
+
+    dataset = import_research_graph_json(payload, metadata(DatasetType.RESEARCH_GRAPH))
+
+    assert dataset.records[1].prerequisite_semantics is PrerequisiteSemantics.ANY
 
 
 def test_override_loader_validates_provenance_and_duplicate_targets(tmp_path) -> None:

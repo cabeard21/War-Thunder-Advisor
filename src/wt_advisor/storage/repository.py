@@ -14,32 +14,55 @@ from sqlalchemy.orm import Session
 
 from wt_advisor.domain.models import (
     BR_LADDER,
+    AcquisitionType,
     AvailabilityType,
     Capability,
+    CapabilityObservation,
+    CapabilityResolution,
+    CapabilitySourceType,
     DatasetType,
     Freshness,
     GameMode,
     Nation,
+    PrerequisiteSemantics,
+    ReconciliationItem,
+    ReconciliationPlan,
+    Researchability,
+    ResearchDomain,
+    ResearchEdge,
+    ResearchEdgeType,
+    ResolvedAvailability,
     SnapshotPurpose,
     SnapshotRef,
     StatisticsScope,
+    TreeMembership,
     UserProfile,
     Vehicle,
     VehicleClass,
     VehicleStatistics,
     VehicleStatus,
+    Visibility,
+    stable_hash,
 )
 from wt_advisor.storage.db import database_session
 from wt_advisor.storage.models import (
+    AvailabilityObservationRow,
+    CapabilityObservationRow,
     DataSnapshotRow,
+    ImportAttemptRow,
     OverrideEntryRow,
     OverrideRevisionRow,
+    ProfileReconciliationAuditRow,
+    ProfileReconciliationItemRow,
     RawArtifactRow,
     ResearchEdgeRow,
+    ResearchGraphEdgeRow,
+    StatisticsImportDiagnosticRow,
     UserProfileRow,
     UserVehicleStateRow,
     VehicleBattleRatingRow,
     VehicleCapabilityRow,
+    VehicleIdentityAliasRow,
     VehicleMetadataRow,
     VehicleRow,
     VehicleSourceIdRow,
@@ -58,6 +81,22 @@ class ImportResult:
 @dataclass(frozen=True, slots=True)
 class CreationResult:
     created: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ImportAttemptResult:
+    attempt_id: int
+    created: bool
+
+
+@dataclass(frozen=True, slots=True)
+class StatisticsImportDiagnostics:
+    snapshot_id: str
+    recognized_columns: tuple[str, ...]
+    unknown_columns: tuple[str, ...]
+    matched_count: int
+    unresolved_source_ids: tuple[str, ...]
+    duplicate_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +130,10 @@ class ResolvedAnalysisBundle:
     statistics_snapshot: SnapshotRef | None
     newest_compatibility: SnapshotCompatibility
     warnings: tuple[str, ...]
+    capability_snapshot: SnapshotRef | None = None
+    availability_snapshot: SnapshotRef | None = None
+    identity_snapshot: SnapshotRef | None = None
+    research_graph_snapshot: SnapshotRef | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +165,18 @@ class VehicleStatusChange:
     after: VehicleStatus
     profile_revision: int
     changed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileReconciliationOutcome:
+    plan: ReconciliationPlan
+    applied: bool
+    changed: bool
+    resulting_revision: int
+
+    @property
+    def items(self) -> tuple[ReconciliationItem, ...]:
+        return self.plan.items
 
 
 class VehicleDataset(Protocol):
@@ -163,9 +218,7 @@ def _vehicle_from_observation(item: Vehicle | Mapping[str, Any] | object) -> Veh
     if isinstance(item, Vehicle):
         return item
     values = _mapping(item)
-    canonical_fields = {
-        field: values[field] for field in Vehicle.model_fields if field in values
-    }
+    canonical_fields = {field: values[field] for field in Vehicle.model_fields if field in values}
     return Vehicle.model_validate(canonical_fields)
 
 
@@ -215,6 +268,8 @@ class EvidenceRepository:
             )
         )
         if same_identity is not None:
+            if same_identity.compatibility_key is None and snapshot.compatibility_key is not None:
+                same_identity.compatibility_key = snapshot.compatibility_key
             return ImportResult(snapshot_id=same_identity.snapshot_id, created=False)
 
         same_id = session.get(DataSnapshotRow, snapshot.snapshot_id)
@@ -297,7 +352,9 @@ class EvidenceRepository:
 
             known_ids = {vehicle.vehicle_id for vehicle in normalized_vehicles}
             existing_ids = set(
-                session.scalars(select(VehicleRow.vehicle_id).where(VehicleRow.vehicle_id.in_(known_ids)))
+                session.scalars(
+                    select(VehicleRow.vehicle_id).where(VehicleRow.vehicle_id.in_(known_ids))
+                )
             )
             session.add_all(
                 VehicleRow(vehicle_id=vehicle_id) for vehicle_id in known_ids - existing_ids
@@ -391,6 +448,331 @@ class EvidenceRepository:
             raw_content=dataset.raw_content,
         )
 
+    def _begin_component_import(
+        self,
+        session: Session,
+        snapshot: SnapshotRef,
+        *,
+        expected_type: DatasetType,
+        raw_content: bytes | str,
+        media_type: str,
+        provider_version: str | None,
+        notes: str | None,
+    ) -> ImportResult:
+        if snapshot.dataset_type is not expected_type:
+            raise ValueError(f"component import requires a {expected_type.value} snapshot")
+        content = self._validated_raw_content(snapshot, raw_content)
+        return self._add_snapshot(
+            session,
+            snapshot,
+            raw_content=content,
+            media_type=media_type,
+            provider_version=provider_version,
+            notes=notes,
+        )
+
+    @staticmethod
+    def _known_vehicle_ids(session: Session) -> set[str]:
+        return set(session.scalars(select(VehicleRow.vehicle_id)))
+
+    @staticmethod
+    def _validate_known_vehicle(known_ids: set[str], vehicle_id: str) -> None:
+        if vehicle_id not in known_ids:
+            raise ValueError(f"component references unknown vehicle {vehicle_id!r}")
+
+    def import_capability_snapshot(
+        self,
+        snapshot: SnapshotRef,
+        observations: Iterable[Mapping[str, Any] | object],
+        *,
+        raw_content: bytes | str,
+        media_type: str = "application/json",
+        provider_version: str | None = None,
+        notes: str | None = None,
+    ) -> ImportResult:
+        normalized = tuple(_mapping(item) for item in observations)
+        with self.session() as session:
+            result = self._begin_component_import(
+                session,
+                snapshot,
+                expected_type=DatasetType.CAPABILITIES,
+                raw_content=raw_content,
+                media_type=media_type,
+                provider_version=provider_version,
+                notes=notes,
+            )
+            if not result.created:
+                return result
+            known_ids = self._known_vehicle_ids(session)
+            for item in normalized:
+                vehicle_id = str(item["vehicle_id"])
+                self._validate_known_vehicle(known_ids, vehicle_id)
+                confidence = item.get("confidence")
+                session.add(
+                    CapabilityObservationRow(
+                        snapshot_id=snapshot.snapshot_id,
+                        vehicle_id=vehicle_id,
+                        capability=_enum_value(item["capability"]),
+                        value=bool(item["value"]),
+                        source_provider=str(item.get("source_provider", snapshot.provider)),
+                        source_type=_enum_value(
+                            item.get("source_type", CapabilitySourceType.CURATED_IMPORT)
+                        ),
+                        source_reference=str(item["source_reference"]),
+                        confidence=1.0 if confidence is None else float(confidence),
+                    )
+                )
+            return result
+
+    def resolve_capabilities(
+        self, vehicle_id: str, *, snapshot_id: str
+    ) -> dict[Capability, CapabilityResolution]:
+        with self.session() as session:
+            rows = tuple(
+                session.scalars(
+                    select(CapabilityObservationRow)
+                    .where(
+                        CapabilityObservationRow.snapshot_id == snapshot_id,
+                        CapabilityObservationRow.vehicle_id == vehicle_id,
+                    )
+                    .order_by(
+                        CapabilityObservationRow.capability,
+                        CapabilityObservationRow.observation_id,
+                    )
+                )
+            )
+        grouped: dict[Capability, list[CapabilityObservation]] = {}
+        for row in rows:
+            capability = Capability(row.capability)
+            grouped.setdefault(capability, []).append(
+                CapabilityObservation(
+                    vehicle_id=row.vehicle_id,
+                    capability=capability,
+                    value=row.value,
+                    source_provider=row.source_provider,
+                    source_snapshot_id=row.snapshot_id,
+                    source_reference=row.source_reference,
+                    source_type=CapabilitySourceType(row.source_type),
+                    confidence=row.confidence,
+                )
+            )
+        return {
+            capability: CapabilityResolution.from_observations(
+                vehicle_id, capability, tuple(observations)
+            )
+            for capability, observations in grouped.items()
+        }
+
+    def import_availability_snapshot(
+        self,
+        snapshot: SnapshotRef,
+        observations: Iterable[Mapping[str, Any] | object],
+        *,
+        raw_content: bytes | str,
+        media_type: str = "application/json",
+        provider_version: str | None = None,
+        notes: str | None = None,
+    ) -> ImportResult:
+        normalized = tuple(_mapping(item) for item in observations)
+        with self.session() as session:
+            result = self._begin_component_import(
+                session,
+                snapshot,
+                expected_type=DatasetType.AVAILABILITY,
+                raw_content=raw_content,
+                media_type=media_type,
+                provider_version=provider_version,
+                notes=notes,
+            )
+            if not result.created:
+                return result
+            known_ids = self._known_vehicle_ids(session)
+            for item in normalized:
+                vehicle_id = str(item["vehicle_id"])
+                self._validate_known_vehicle(known_ids, vehicle_id)
+                confidence = item.get("confidence")
+                session.add(
+                    AvailabilityObservationRow(
+                        snapshot_id=snapshot.snapshot_id,
+                        vehicle_id=vehicle_id,
+                        acquisition_type=_enum_value(item["acquisition_type"]),
+                        researchability=_enum_value(item["researchability"]),
+                        tree_membership=_enum_value(item["tree_membership"]),
+                        visibility=_enum_value(item["visibility"]),
+                        source_provider=str(item.get("source_provider", snapshot.provider)),
+                        source_reference=str(item["source_reference"]),
+                        confidence=1.0 if confidence is None else float(confidence),
+                    )
+                )
+            return result
+
+    def get_resolved_availability(
+        self, vehicle_id: str, *, snapshot_id: str
+    ) -> ResolvedAvailability | None:
+        with self.session() as session:
+            row = session.get(AvailabilityObservationRow, (snapshot_id, vehicle_id))
+            if row is None:
+                return None
+            return ResolvedAvailability(
+                vehicle_id=row.vehicle_id,
+                acquisition_type=AcquisitionType(row.acquisition_type),
+                researchability=Researchability(row.researchability),
+                tree_membership=TreeMembership(row.tree_membership),
+                visibility=Visibility(row.visibility),
+                source_snapshot_id=row.snapshot_id,
+                source_provider=row.source_provider,
+                source_reference=row.source_reference,
+                reason="resolved from versioned availability observation",
+            )
+
+    def import_identity_snapshot(
+        self,
+        snapshot: SnapshotRef,
+        aliases: Iterable[Mapping[str, Any] | object],
+        *,
+        raw_content: bytes | str,
+        media_type: str = "application/json",
+        provider_version: str | None = None,
+        notes: str | None = None,
+    ) -> ImportResult:
+        normalized = tuple(_mapping(item) for item in aliases)
+        with self.session() as session:
+            result = self._begin_component_import(
+                session,
+                snapshot,
+                expected_type=DatasetType.IDENTITY_ALIASES,
+                raw_content=raw_content,
+                media_type=media_type,
+                provider_version=provider_version,
+                notes=notes,
+            )
+            if not result.created:
+                return result
+            known_ids = self._known_vehicle_ids(session)
+            for item in normalized:
+                canonical_id = str(item["canonical_vehicle_id"])
+                self._validate_known_vehicle(known_ids, canonical_id)
+                session.add(
+                    VehicleIdentityAliasRow(
+                        snapshot_id=snapshot.snapshot_id,
+                        provider=str(item.get("provider", snapshot.provider)),
+                        source_vehicle_id=str(item["source_vehicle_id"]),
+                        canonical_vehicle_id=canonical_id,
+                        deprecated_vehicle_id=(
+                            None
+                            if item.get("deprecated_vehicle_id") is None
+                            else str(item["deprecated_vehicle_id"])
+                        ),
+                        confirmed=bool(item.get("confirmed", False)),
+                        source_reference=str(item["source_reference"]),
+                    )
+                )
+            return result
+
+    def resolve_canonical_vehicle_id(
+        self, provider: str, source_vehicle_id: str, *, snapshot_id: str
+    ) -> str | None:
+        with self.session() as session:
+            row = session.scalar(
+                select(VehicleIdentityAliasRow).where(
+                    VehicleIdentityAliasRow.snapshot_id == snapshot_id,
+                    VehicleIdentityAliasRow.provider == provider,
+                    VehicleIdentityAliasRow.source_vehicle_id == source_vehicle_id,
+                    VehicleIdentityAliasRow.confirmed.is_(True),
+                )
+            )
+            return None if row is None else row.canonical_vehicle_id
+
+    def list_confirmed_identity_aliases(
+        self, *, snapshot_id: str, provider: str
+    ) -> dict[str, str]:
+        """Return active, provider-scoped aliases for import-time identity resolution."""
+
+        with self.session() as session:
+            rows = tuple(
+                session.scalars(
+                    select(VehicleIdentityAliasRow)
+                    .where(
+                        VehicleIdentityAliasRow.snapshot_id == snapshot_id,
+                        VehicleIdentityAliasRow.provider == provider,
+                        VehicleIdentityAliasRow.confirmed.is_(True),
+                    )
+                    .order_by(VehicleIdentityAliasRow.source_vehicle_id)
+                )
+            )
+        return {row.source_vehicle_id: row.canonical_vehicle_id for row in rows}
+
+    def import_research_graph_snapshot(
+        self,
+        snapshot: SnapshotRef,
+        edges: Iterable[ResearchEdge | Mapping[str, Any] | object],
+        *,
+        raw_content: bytes | str,
+        media_type: str = "application/json",
+        provider_version: str | None = None,
+        notes: str | None = None,
+    ) -> ImportResult:
+        normalized = tuple(_mapping(item) for item in edges)
+        with self.session() as session:
+            result = self._begin_component_import(
+                session,
+                snapshot,
+                expected_type=DatasetType.RESEARCH_GRAPH,
+                raw_content=raw_content,
+                media_type=media_type,
+                provider_version=provider_version,
+                notes=notes,
+            )
+            if not result.created:
+                return result
+            known_ids = self._known_vehicle_ids(session)
+            for item in normalized:
+                parent_id = str(item["parent_vehicle_id"])
+                child_id = str(item["child_vehicle_id"])
+                self._validate_known_vehicle(known_ids, parent_id)
+                self._validate_known_vehicle(known_ids, child_id)
+                semantics = item.get("prerequisite_semantics", item.get("group_semantics", "all"))
+                session.add(
+                    ResearchGraphEdgeRow(
+                        snapshot_id=snapshot.snapshot_id,
+                        nation=_enum_value(item["nation"]),
+                        domain=_enum_value(item["domain"]),
+                        parent_vehicle_id=parent_id,
+                        child_vehicle_id=child_id,
+                        edge_type=_enum_value(item["edge_type"]),
+                        prerequisite_group=str(item["prerequisite_group"]),
+                        group_semantics=_enum_value(semantics),
+                    )
+                )
+            return result
+
+    def list_research_graph_edges(self, *, snapshot_id: str) -> tuple[ResearchEdge, ...]:
+        with self.session() as session:
+            rows = tuple(
+                session.scalars(
+                    select(ResearchGraphEdgeRow)
+                    .where(ResearchGraphEdgeRow.snapshot_id == snapshot_id)
+                    .order_by(
+                        ResearchGraphEdgeRow.child_vehicle_id,
+                        ResearchGraphEdgeRow.prerequisite_group,
+                        ResearchGraphEdgeRow.parent_vehicle_id,
+                    )
+                )
+            )
+        return tuple(
+            ResearchEdge(
+                nation=Nation(row.nation),
+                domain=ResearchDomain(row.domain),
+                parent_vehicle_id=row.parent_vehicle_id,
+                child_vehicle_id=row.child_vehicle_id,
+                edge_type=ResearchEdgeType(row.edge_type),
+                prerequisite_group=row.prerequisite_group,
+                prerequisite_semantics=PrerequisiteSemantics(row.group_semantics),
+                snapshot_id=row.snapshot_id,
+            )
+            for row in rows
+        )
+
     def import_statistics_snapshot(
         self,
         snapshot: SnapshotRef,
@@ -400,15 +782,22 @@ class EvidenceRepository:
         media_type: str = "application/json",
         provider_version: str | None = None,
         notes: str | None = None,
+        diagnostics: Mapping[str, Any] | object | None = None,
     ) -> ImportResult:
         if snapshot.dataset_type is not DatasetType.GLOBAL_STATISTICS:
             raise ValueError("statistics import requires a global-statistics snapshot")
         content = self._validated_raw_content(snapshot, raw_content)
-        normalized: list[VehicleStatistics] = []
+        normalized: list[tuple[VehicleStatistics, str | None]] = []
         for item in statistics:
             values = _mapping(item)
+            ratio_provenance = values.pop("ratio_provenance", None)
             values["snapshot_id"] = snapshot.snapshot_id
-            normalized.append(VehicleStatistics.model_validate(values))
+            normalized.append(
+                (
+                    VehicleStatistics.model_validate(values),
+                    None if ratio_provenance is None else _enum_value(ratio_provenance),
+                )
+            )
 
         with self.session() as session:
             result = self._add_snapshot(
@@ -422,7 +811,7 @@ class EvidenceRepository:
             if not result.created:
                 return result
             known_ids = set(session.scalars(select(VehicleRow.vehicle_id)))
-            for item in normalized:
+            for item, ratio_provenance in normalized:
                 if item.vehicle_id not in known_ids:
                     raise ValueError(f"statistics reference unknown vehicle {item.vehicle_id!r}")
                 session.add(
@@ -440,6 +829,22 @@ class EvidenceRepository:
                         ground_kills=item.ground_kills,
                         air_kills=item.air_kills,
                         deaths=item.deaths,
+                        reported_win_rate=item.reported_win_rate,
+                        reported_kd=item.reported_kd,
+                        reported_kills_per_battle=item.reported_kills_per_battle,
+                        ratio_provenance=ratio_provenance,
+                    )
+                )
+            if diagnostics is not None:
+                diagnostic = _mapping(diagnostics)
+                session.add(
+                    StatisticsImportDiagnosticRow(
+                        snapshot_id=snapshot.snapshot_id,
+                        recognized_columns=list(diagnostic.get("recognized_columns", ())),
+                        unknown_columns=list(diagnostic.get("unknown_columns", ())),
+                        matched_count=int(diagnostic.get("matched_count", len(normalized))),
+                        unresolved_source_ids=list(diagnostic.get("unresolved_source_ids", ())),
+                        duplicate_count=int(diagnostic.get("duplicate_count", 0)),
                     )
                 )
             return result
@@ -453,6 +858,63 @@ class EvidenceRepository:
             records,
             raw_content=dataset.raw_content,
         )
+
+    def get_statistics_import_diagnostics(
+        self, snapshot_id: str
+    ) -> StatisticsImportDiagnostics | None:
+        with self.session() as session:
+            row = session.get(StatisticsImportDiagnosticRow, snapshot_id)
+            if row is None:
+                return None
+            return StatisticsImportDiagnostics(
+                snapshot_id=row.snapshot_id,
+                recognized_columns=tuple(row.recognized_columns),
+                unknown_columns=tuple(row.unknown_columns),
+                matched_count=row.matched_count,
+                unresolved_source_ids=tuple(row.unresolved_source_ids),
+                duplicate_count=row.duplicate_count,
+            )
+
+    def record_import_attempt(
+        self,
+        *,
+        dataset_type: DatasetType | str,
+        provider: str,
+        raw_content: bytes | str,
+        status: str,
+        error: str | None,
+        attempted_at: datetime | None = None,
+        media_type: str = "application/json",
+    ) -> ImportAttemptResult:
+        content = raw_content.encode("utf-8") if isinstance(raw_content, str) else raw_content
+        if len(content) > MAX_RAW_ARTIFACT_BYTES:
+            raise ValueError("raw artifact exceeds configured byte limit")
+        checksum = sha256(content).hexdigest()
+        dataset_value = _enum_value(dataset_type)
+        with self.session() as session:
+            existing = session.scalar(
+                select(ImportAttemptRow).where(
+                    ImportAttemptRow.dataset_type == dataset_value,
+                    ImportAttemptRow.provider == provider,
+                    ImportAttemptRow.raw_checksum == checksum,
+                    ImportAttemptRow.status == status,
+                )
+            )
+            if existing is not None:
+                return ImportAttemptResult(attempt_id=existing.attempt_id, created=False)
+            row = ImportAttemptRow(
+                dataset_type=dataset_value,
+                provider=provider,
+                attempted_at=attempted_at or datetime.now(UTC),
+                status=status,
+                error=error,
+                raw_checksum=checksum,
+                media_type=media_type,
+                raw_content=content,
+            )
+            session.add(row)
+            session.flush()
+            return ImportAttemptResult(attempt_id=row.attempt_id, created=True)
 
     def import_override_revision(
         self,
@@ -576,6 +1038,94 @@ class EvidenceRepository:
             )
         return SnapshotCompatibility(status="compatible", reason="canonical identities compatible")
 
+    def component_compatibility(
+        self, vehicle_snapshot: SnapshotRef, component_snapshot: SnapshotRef
+    ) -> SnapshotCompatibility:
+        """Validate purpose/key and canonical-ID subset for an optional component."""
+
+        if component_snapshot.purpose is not vehicle_snapshot.purpose:
+            return SnapshotCompatibility(status="incompatible", reason="snapshot purpose mismatch")
+        if vehicle_snapshot.purpose is SnapshotPurpose.ACCEPTANCE:
+            if (
+                vehicle_snapshot.compatibility_key is None
+                or component_snapshot.compatibility_key != vehicle_snapshot.compatibility_key
+            ):
+                return SnapshotCompatibility(
+                    status="incompatible",
+                    reason="acceptance snapshots are not members of the same frozen bundle",
+                )
+        elif (
+            vehicle_snapshot.compatibility_key is not None
+            or component_snapshot.compatibility_key is not None
+        ) and component_snapshot.compatibility_key != vehicle_snapshot.compatibility_key:
+            return SnapshotCompatibility(
+                status="incompatible", reason="snapshot compatibility keys do not match"
+            )
+        vehicle_ids = {
+            vehicle.vehicle_id
+            for vehicle in self.list_vehicles(snapshot_id=vehicle_snapshot.snapshot_id)
+        }
+        with self.session() as session:
+            model_and_columns: dict[DatasetType, tuple[type[Any], tuple[Any, ...]]] = {
+                DatasetType.CAPABILITIES: (
+                    CapabilityObservationRow,
+                    (CapabilityObservationRow.vehicle_id,),
+                ),
+                DatasetType.AVAILABILITY: (
+                    AvailabilityObservationRow,
+                    (AvailabilityObservationRow.vehicle_id,),
+                ),
+                DatasetType.IDENTITY_ALIASES: (
+                    VehicleIdentityAliasRow,
+                    (VehicleIdentityAliasRow.canonical_vehicle_id,),
+                ),
+                DatasetType.RESEARCH_GRAPH: (
+                    ResearchGraphEdgeRow,
+                    (
+                        ResearchGraphEdgeRow.parent_vehicle_id,
+                        ResearchGraphEdgeRow.child_vehicle_id,
+                    ),
+                ),
+            }
+            definition = model_and_columns.get(component_snapshot.dataset_type)
+            if definition is None:
+                raise ValueError("unsupported component snapshot type")
+            model, columns = definition
+            referenced: set[str] = set()
+            for column in columns:
+                referenced.update(
+                    session.scalars(
+                        select(column).where(model.snapshot_id == component_snapshot.snapshot_id)
+                    )
+                )
+        missing = tuple(sorted(referenced - vehicle_ids))
+        if missing:
+            return SnapshotCompatibility(
+                status="incompatible",
+                reason="component references canonical IDs absent from vehicle evidence",
+                missing_vehicle_ids=missing,
+            )
+        return SnapshotCompatibility(status="compatible", reason="canonical identities compatible")
+
+    def latest_compatible_component(
+        self, vehicle_snapshot: SnapshotRef, dataset_type: DatasetType
+    ) -> SnapshotRef | None:
+        if dataset_type not in {
+            DatasetType.CAPABILITIES,
+            DatasetType.AVAILABILITY,
+            DatasetType.IDENTITY_ALIASES,
+            DatasetType.RESEARCH_GRAPH,
+        }:
+            raise ValueError("dataset type is not an optional evidence component")
+        return next(
+            (
+                candidate
+                for candidate in self.list_snapshots(dataset_type)
+                if self.component_compatibility(vehicle_snapshot, candidate).compatible
+            ),
+            None,
+        )
+
     def resolve_analysis_bundle(self) -> ResolvedAnalysisBundle:
         """Resolve current vehicle evidence first and optional compatible statistics second."""
 
@@ -609,6 +1159,18 @@ class EvidenceRepository:
             statistics_snapshot=selected_statistics,
             newest_compatibility=newest_compatibility,
             warnings=warnings,
+            capability_snapshot=self.latest_compatible_component(
+                vehicle_snapshot, DatasetType.CAPABILITIES
+            ),
+            availability_snapshot=self.latest_compatible_component(
+                vehicle_snapshot, DatasetType.AVAILABILITY
+            ),
+            identity_snapshot=self.latest_compatible_component(
+                vehicle_snapshot, DatasetType.IDENTITY_ALIASES
+            ),
+            research_graph_snapshot=self.latest_compatible_component(
+                vehicle_snapshot, DatasetType.RESEARCH_GRAPH
+            ),
         )
 
     @staticmethod
@@ -781,6 +1343,9 @@ class EvidenceRepository:
                     ground_kills=row.ground_kills,
                     air_kills=row.air_kills,
                     deaths=row.deaths,
+                    reported_win_rate=row.reported_win_rate,
+                    reported_kd=row.reported_kd,
+                    reported_kills_per_battle=row.reported_kills_per_battle,
                 )
                 for row in rows
             )
@@ -861,6 +1426,9 @@ class EvidenceRepository:
             else:
                 state.status = normalized_status.value
                 state.revision = profile.revision
+                state.superseded = False
+                state.superseded_at = None
+                state.superseded_by_vehicle_id = None
             return VehicleStatusChange(
                 before=before,
                 after=normalized_status,
@@ -874,7 +1442,153 @@ class EvidenceRepository:
                 raise LookupError(f"unknown profile {profile_id!r}")
             rows = session.scalars(
                 select(UserVehicleStateRow)
-                .where(UserVehicleStateRow.profile_id == profile_id)
+                .where(
+                    UserVehicleStateRow.profile_id == profile_id,
+                    UserVehicleStateRow.superseded.is_(False),
+                )
                 .order_by(UserVehicleStateRow.vehicle_id)
             )
             return {row.vehicle_id: VehicleStatus(row.status) for row in rows}
+
+    def reconcile_profile_aliases(
+        self,
+        profile_id: str,
+        *,
+        identity_snapshot_id: str,
+        expected_revision: int | str,
+        apply: bool = False,
+    ) -> ProfileReconciliationOutcome:
+        """Plan or atomically apply confirmed canonical-alias profile merges."""
+
+        expected = int(str(expected_revision).removeprefix("rev-"))
+        progression = {
+            VehicleStatus.UNKNOWN: 0,
+            VehicleStatus.LOCKED: 1,
+            VehicleStatus.AVAILABLE_TO_RESEARCH: 2,
+            VehicleStatus.RESEARCHING: 3,
+            VehicleStatus.UNLOCKED_NOT_PURCHASED: 4,
+            VehicleStatus.OWNED: 5,
+        }
+        with self.session() as session:
+            profile = session.get(UserProfileRow, profile_id)
+            if profile is None:
+                raise LookupError(f"unknown profile {profile_id!r}")
+            if profile.revision != expected:
+                raise ValueError(
+                    f"profile revision changed: expected {expected}, found {profile.revision}"
+                )
+            snapshot = session.get(DataSnapshotRow, identity_snapshot_id)
+            if snapshot is None or snapshot.dataset_type != DatasetType.IDENTITY_ALIASES.value:
+                raise LookupError(f"unknown identity snapshot {identity_snapshot_id!r}")
+            aliases = tuple(
+                session.scalars(
+                    select(VehicleIdentityAliasRow)
+                    .where(
+                        VehicleIdentityAliasRow.snapshot_id == identity_snapshot_id,
+                        VehicleIdentityAliasRow.confirmed.is_(True),
+                        VehicleIdentityAliasRow.deprecated_vehicle_id.is_not(None),
+                    )
+                    .order_by(VehicleIdentityAliasRow.deprecated_vehicle_id)
+                )
+            )
+            planned: list[
+                tuple[ReconciliationItem, UserVehicleStateRow, UserVehicleStateRow | None]
+            ] = []
+            for alias in aliases:
+                deprecated_id = alias.deprecated_vehicle_id
+                if deprecated_id is None:
+                    continue
+                old_state = session.get(UserVehicleStateRow, (profile_id, deprecated_id))
+                if old_state is None or old_state.superseded:
+                    continue
+                canonical_state = session.get(
+                    UserVehicleStateRow, (profile_id, alias.canonical_vehicle_id)
+                )
+                old_status = VehicleStatus(old_state.status)
+                current_status = (
+                    VehicleStatus.UNKNOWN
+                    if canonical_state is None or canonical_state.superseded
+                    else VehicleStatus(canonical_state.status)
+                )
+                chosen = max((old_status, current_status), key=progression.__getitem__)
+                item = ReconciliationItem(
+                    deprecated_vehicle_id=deprecated_id,
+                    canonical_vehicle_id=alias.canonical_vehicle_id,
+                    deprecated_status=old_status,
+                    canonical_status=current_status,
+                    chosen_status=chosen,
+                    reason="confirmed alias merged using most-progressed status",
+                    collision=canonical_state is not None and old_status is not current_status,
+                )
+                planned.append((item, old_state, canonical_state))
+            items = tuple(item for item, _, _ in planned)
+            plan_payload = {
+                "profile_id": profile_id,
+                "expected_revision": str(expected),
+                "alias_revision": identity_snapshot_id,
+                "items": [item.model_dump(mode="json") for item in items],
+            }
+            plan = ReconciliationPlan(
+                profile_id=profile_id,
+                expected_revision=str(expected),
+                alias_revision=identity_snapshot_id,
+                items=items,
+                plan_id=stable_hash(plan_payload),
+                already_applied=not items,
+            )
+            if not apply or not planned:
+                return ProfileReconciliationOutcome(
+                    plan=plan,
+                    applied=apply,
+                    changed=False,
+                    resulting_revision=profile.revision,
+                )
+
+            profile.revision += 1
+            now = datetime.now(UTC)
+            audit = ProfileReconciliationAuditRow(
+                profile_id=profile_id,
+                identity_snapshot_id=identity_snapshot_id,
+                source_revision=expected,
+                resulting_revision=profile.revision,
+                applied_at=now,
+            )
+            session.add(audit)
+            session.flush()
+            for item, old_state, canonical_state in planned:
+                if canonical_state is None:
+                    canonical_state = UserVehicleStateRow(
+                        profile_id=profile_id,
+                        vehicle_id=item.canonical_vehicle_id,
+                        status=item.chosen_status.value,
+                        revision=profile.revision,
+                        superseded=False,
+                    )
+                    session.add(canonical_state)
+                else:
+                    canonical_state.status = item.chosen_status.value
+                    canonical_state.revision = profile.revision
+                    canonical_state.superseded = False
+                    canonical_state.superseded_at = None
+                    canonical_state.superseded_by_vehicle_id = None
+                old_state.superseded = True
+                old_state.superseded_at = now
+                old_state.superseded_by_vehicle_id = item.canonical_vehicle_id
+                session.add(
+                    ProfileReconciliationItemRow(
+                        audit_id=audit.audit_id,
+                        deprecated_vehicle_id=item.deprecated_vehicle_id,
+                        canonical_vehicle_id=item.canonical_vehicle_id,
+                        deprecated_status=item.deprecated_status.value,
+                        canonical_status=item.canonical_status.value,
+                        chosen_status=item.chosen_status.value,
+                        conflict=item.collision,
+                        reason=item.reason,
+                    )
+                )
+            return ProfileReconciliationOutcome(
+                plan=plan,
+                applied=True,
+                changed=True,
+                resulting_revision=profile.revision,
+            )

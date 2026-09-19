@@ -14,6 +14,8 @@ from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validat
 from wt_advisor.domain.models import (
     BR_LADDER,
     Capability,
+    CapabilityResolution,
+    CapabilityState,
     Role,
     RuleResult,
     RuleStatus,
@@ -25,6 +27,11 @@ from wt_advisor.domain.models import (
     br_step_distance,
     stable_hash,
 )
+
+CapabilityResolutionInput = CapabilityResolution | CapabilityState | str
+CapabilityResolutionMap = Mapping[
+    str, Mapping[Capability, CapabilityResolutionInput]
+]
 
 
 class _ConfigModel(BaseModel):
@@ -39,6 +46,7 @@ class RuleWeights(_ConfigModel):
     scouting: float = Field(ge=0)
     uptier_resilience: float = Field(ge=0)
     statistical_strength: float = Field(ge=0)
+    role_redundancy: float = Field(default=0.0, ge=0)
 
     @model_validator(mode="after")
     def sum_to_one(self) -> RuleWeights:
@@ -121,6 +129,7 @@ class StatusConfig(_ConfigModel):
 
 
 class Ruleset(_ConfigModel):
+    ruleset_id: str = "m1-baseline-v1"
     weights: RuleWeights
     br_cohesion: BandScores
     backup_depth: BackupScores
@@ -133,7 +142,11 @@ class Ruleset(_ConfigModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def content_hash(self) -> str:
-        return stable_hash(self.model_dump(exclude={"content_hash"}))
+        # Fields introduced after M1 are excluded when absent from its source TOML. This keeps
+        # the frozen M1 hash stable while allowing later rulesets to grow explicitly.
+        return stable_hash(
+            self.model_dump(exclude={"content_hash"}, exclude_unset=True)
+        )
 
 
 class PeerStatistic(_ConfigModel):
@@ -162,8 +175,15 @@ class RulesEvaluation(_ConfigModel):
 def load_ruleset(path: str | Path | None = None) -> Ruleset:
     """Load and validate a ruleset; defaults are packaged with the application."""
 
+    named_rulesets = {
+        "m1-baseline-v1": "m1-baseline-v1.toml",
+        "m2-capability-aware-v1": "m2-capability-aware-v1.toml",
+    }
     if path is None:
         resource = files("wt_advisor").joinpath("config/defaults.toml")
+        payload = tomllib.loads(resource.read_text(encoding="utf-8"))
+    elif str(path) in named_rulesets:
+        resource = files("wt_advisor").joinpath("config", named_rulesets[str(path)])
         payload = tomllib.loads(resource.read_text(encoding="utf-8"))
     else:
         with Path(path).open("rb") as stream:
@@ -186,6 +206,15 @@ def _status(score: float, ruleset: Ruleset) -> RuleStatus:
 def infer_roles(vehicle: Vehicle) -> frozenset[Role]:
     """Infer lineup roles solely from factual class and capability data."""
 
+    roles = _class_roles(vehicle)
+    if Capability.SCOUTING in vehicle.capabilities:
+        roles.add(Role.SCOUT)
+    if vehicle.capabilities & {Capability.ATGM, Capability.HIGH_CALIBER_HE}:
+        roles.add(Role.ANTI_ARMOR_SPECIALIST)
+    return frozenset(roles)
+
+
+def _class_roles(vehicle: Vehicle) -> set[Role]:
     roles: set[Role] = set()
     if vehicle.vehicle_class is VehicleClass.SPAA:
         roles.add(Role.SPAA)
@@ -198,11 +227,7 @@ def infer_roles(vehicle: Vehicle) -> frozenset[Role]:
     elif vehicle.vehicle_class is VehicleClass.TANK_DESTROYER:
         roles.update((Role.TANK_DESTROYER, Role.SNIPER))
 
-    if Capability.SCOUTING in vehicle.capabilities:
-        roles.add(Role.SCOUT)
-    if vehicle.capabilities & {Capability.ATGM, Capability.HIGH_CALIBER_HE}:
-        roles.add(Role.ANTI_ARMOR_SPECIALIST)
-    return frozenset(roles)
+    return roles
 
 
 def _distance_scores(
@@ -276,10 +301,20 @@ def backup_depth_rule(
 
 
 def role_coverage_rule(
-    vehicles: Sequence[Vehicle], ruleset: Ruleset | None = None
+    vehicles: Sequence[Vehicle],
+    ruleset: Ruleset | None = None,
+    *,
+    capability_resolutions: CapabilityResolutionMap | None = None,
 ) -> RuleResult:
     config = _ruleset(ruleset)
-    role_map = {vehicle.vehicle_id: infer_roles(vehicle) for vehicle in vehicles}
+    role_map = {
+        vehicle.vehicle_id: (
+            _m2_roles(vehicle, capability_resolutions)
+            if config.ruleset_id == "m2-capability-aware-v1"
+            else infer_roles(vehicle)
+        )
+        for vehicle in vehicles
+    }
     all_roles = frozenset().union(*role_map.values()) if role_map else frozenset()
     categories = {
         "frontline": bool(
@@ -319,6 +354,20 @@ def role_coverage_rule(
     )
 
 
+def _m2_roles(
+    vehicle: Vehicle, resolutions: CapabilityResolutionMap | None
+) -> frozenset[Role]:
+    roles = _class_roles(vehicle)
+    if _capability_state(vehicle, Capability.SCOUTING, resolutions) == "present":
+        roles.add(Role.SCOUT)
+    if any(
+        _capability_state(vehicle, capability, resolutions) == "present"
+        for capability in (Capability.ATGM, Capability.HIGH_CALIBER_HE)
+    ):
+        roles.add(Role.ANTI_ARMOR_SPECIALIST)
+    return frozenset(roles)
+
+
 def anti_air_rule(
     vehicles: Sequence[Vehicle],
     nearby_spaa: Sequence[tuple[Vehicle, VehicleStatus]] = (),
@@ -353,22 +402,96 @@ def anti_air_rule(
 
 
 def scouting_rule(
-    vehicles: Sequence[Vehicle], ruleset: Ruleset | None = None
+    vehicles: Sequence[Vehicle],
+    ruleset: Ruleset | None = None,
+    *,
+    capability_resolutions: CapabilityResolutionMap | None = None,
 ) -> RuleResult:
     config = _ruleset(ruleset)
+    if config.ruleset_id != "m2-capability-aware-v1":
+        scouts = sorted(
+            vehicle.vehicle_id
+            for vehicle in vehicles
+            if Capability.SCOUTING in vehicle.capabilities
+        )
+        legacy_score = 100.0 if scouts else 0.0
+        return RuleResult(
+            rule="scouting",
+            score=legacy_score,
+            effective_score=legacy_score,
+            status=_status(legacy_score, config),
+            evidence={"scouting_vehicle_ids": scouts},
+            warnings=() if scouts else ("lineup has no scouting capability",),
+            explanation="Scouting is present when at least one vehicle has the factual capability.",
+        )
+
+    states = {
+        vehicle.vehicle_id: _capability_state(
+            vehicle, Capability.SCOUTING, capability_resolutions
+        )
+        for vehicle in vehicles
+    }
     scouts = sorted(
-        vehicle.vehicle_id for vehicle in vehicles if Capability.SCOUTING in vehicle.capabilities
+        vehicle_id for vehicle_id, state in states.items() if state == "present"
     )
-    score = 100.0 if scouts else 0.0
+    score: float | None
+    if scouts:
+        state, score, effective, status = "present", 100.0, 100.0, RuleStatus.GOOD
+        warnings: tuple[str, ...] = ()
+    elif states and all(value == "verified_absent" for value in states.values()):
+        state, score, effective, status = (
+            "verified_absent",
+            0.0,
+            0.0,
+            RuleStatus.CRITICAL,
+        )
+        warnings = ("lineup has no scouting capability",)
+    else:
+        state, score, effective, status = "unknown", None, 50.0, RuleStatus.UNKNOWN
+        warnings = ("capability_evidence_incomplete",)
     return RuleResult(
         rule="scouting",
         score=score,
-        effective_score=score,
-        status=_status(score, config),
-        evidence={"scouting_vehicle_ids": scouts},
-        warnings=() if scouts else ("lineup has no scouting capability",),
-        explanation="Scouting is present when at least one vehicle has the factual capability.",
+        effective_score=effective,
+        status=status,
+        evidence={
+            "state": state,
+            "scouting_vehicle_ids": scouts,
+            "state_by_vehicle": dict(sorted(states.items())),
+        },
+        warnings=warnings,
+        explanation=(
+            "Scouting distinguishes present, verified-absent, and incomplete capability evidence."
+        ),
     )
+
+
+def _resolution_value(value: CapabilityResolutionInput) -> str:
+    """Normalize domain resolution enums/models without coupling rules to storage DTOs."""
+
+    candidate = value.state if isinstance(value, CapabilityResolution) else value
+    candidate = getattr(candidate, "value", candidate)
+    normalized = str(candidate).lower()
+    return normalized if normalized in {
+        "present",
+        "verified_absent",
+        "unknown",
+        "conflicted",
+    } else "unknown"
+
+
+def _capability_state(
+    vehicle: Vehicle,
+    capability: Capability,
+    resolutions: CapabilityResolutionMap | None,
+) -> str:
+    observations = resolutions.get(vehicle.vehicle_id, {}) if resolutions else {}
+    raw = observations.get(capability)
+    if raw is None:
+        # Existing explicit positive facts remain useful in M2. Absence is never inferred.
+        return "present" if capability in vehicle.capabilities else "unknown"
+    state = _resolution_value(raw)
+    return "unknown" if state == "conflicted" else state
 
 
 def _utility(vehicle: Vehicle) -> Literal["high", "medium", "low", "unknown"]:
@@ -388,24 +511,242 @@ def _utility(vehicle: Vehicle) -> Literal["high", "medium", "low", "unknown"]:
 
 
 def uptier_resilience_rule(
-    vehicles: Sequence[Vehicle], ruleset: Ruleset | None = None
+    vehicles: Sequence[Vehicle],
+    ruleset: Ruleset | None = None,
+    *,
+    capability_resolutions: CapabilityResolutionMap | None = None,
 ) -> RuleResult:
     config = _ruleset(ruleset)
-    utility = {vehicle.vehicle_id: _utility(vehicle) for vehicle in vehicles}
+    if config.ruleset_id == "m2-capability-aware-v1":
+        relevant = (
+            Capability.SCOUTING,
+            Capability.STABILIZER,
+            Capability.VERTICAL_STABILIZER,
+            Capability.SMOKE,
+            Capability.ARTILLERY,
+            Capability.HIGH_CALIBER_HE,
+        )
+        capability_inputs = {
+            vehicle.vehicle_id: {
+                capability.value: _capability_state(
+                    vehicle, capability, capability_resolutions
+                )
+                for capability in relevant
+            }
+            for vehicle in vehicles
+        }
+        utility = {
+            vehicle.vehicle_id: _m2_utility(
+                vehicle, capability_inputs[vehicle.vehicle_id]
+            )
+            for vehicle in vehicles
+        }
+        inputs = {
+            vehicle.vehicle_id: capability_inputs[vehicle.vehicle_id]
+            | {
+                "vehicle_class": vehicle.vehicle_class.value,
+                "selected_band": utility[vehicle.vehicle_id],
+                "selected_reason": _m2_utility_reason(
+                    vehicle, capability_inputs[vehicle.vehicle_id]
+                ),
+            }
+            for vehicle in vehicles
+        }
+    else:
+        utility = {vehicle.vehicle_id: _utility(vehicle) for vehicle in vehicles}
+        inputs = {}
     scores = config.uptier.model_dump()
     score = fmean(scores[value] for value in utility.values()) if utility else config.uptier.unknown
     unknown = sorted(key for key, value in utility.items() if value == "unknown")
+    evidence: dict[str, Any] = {
+        "utility_by_vehicle": dict(sorted(utility.items())),
+        "proxy": True,
+    }
+    if config.ruleset_id == "m2-capability-aware-v1":
+        evidence["inputs_by_vehicle"] = dict(sorted(inputs.items()))
     return RuleResult(
         rule="uptier_resilience",
         score=score,
         effective_score=score,
         status=_status(score, config),
-        evidence={"utility_by_vehicle": dict(sorted(utility.items())), "proxy": True},
+        evidence=evidence,
         warnings=("uptier utility unknown: " + ", ".join(unknown),) if unknown else (),
         explanation=(
             "Proxy grades utility/scouting as high, specialists as medium, "
             "armor reliance as low."
         ),
+    )
+
+
+def _m2_utility(
+    vehicle: Vehicle, capability_states: Mapping[str, str]
+) -> Literal["high", "medium", "low", "unknown"]:
+    if (
+        capability_states[Capability.SCOUTING.value] == "present"
+        or vehicle.vehicle_class is VehicleClass.SPAA
+    ):
+        return "high"
+    if vehicle.vehicle_class in {VehicleClass.LIGHT_TANK, VehicleClass.TANK_DESTROYER}:
+        return "medium"
+    if any(
+        capability_states[item.value] == "present"
+        for item in (
+            Capability.STABILIZER,
+            Capability.VERTICAL_STABILIZER,
+            Capability.SMOKE,
+            Capability.ARTILLERY,
+            Capability.HIGH_CALIBER_HE,
+        )
+    ):
+        return "medium"
+    if all(value == "verified_absent" for value in capability_states.values()):
+        return "low"
+    return "unknown"
+
+
+def _m2_utility_reason(vehicle: Vehicle, capability_states: Mapping[str, str]) -> str:
+    band = _m2_utility(vehicle, capability_states)
+    if capability_states[Capability.SCOUTING.value] == "present":
+        return "verified_scouting"
+    if vehicle.vehicle_class is VehicleClass.SPAA:
+        return "spaa_utility"
+    if vehicle.vehicle_class is VehicleClass.LIGHT_TANK:
+        return "mobility_class"
+    if vehicle.vehicle_class is VehicleClass.TANK_DESTROYER:
+        return "anti_armor_class"
+    if band == "medium":
+        return "verified_support_capability"
+    if band == "low":
+        return "verified_no_relevant_utility"
+    return "capability_evidence_incomplete"
+
+
+def role_redundancy_rule(
+    vehicles: Sequence[Vehicle],
+    resolved_brs: Mapping[str, int],
+    *,
+    eligible_alternatives: Sequence[tuple[Vehicle, int]] = (),
+    capability_resolutions: CapabilityResolutionMap | None = None,
+    statistics_by_vehicle: Mapping[str, VehicleStatistics] | None = None,
+    heavy_aa_requested: bool = False,
+    ruleset: Ruleset | None = None,
+) -> RuleResult:
+    """Diagnose near-equivalent specialist slots without affecting score/readiness."""
+
+    config = _ruleset(ruleset)
+    specialist = sorted(
+        (vehicle for vehicle in vehicles if vehicle.vehicle_class is VehicleClass.SPAA),
+        key=lambda item: item.vehicle_id,
+    )
+    lineup_br = max(resolved_brs.values()) if resolved_brs else None
+    alternatives = sorted(
+        vehicle.vehicle_id
+        for vehicle, battle_rating in eligible_alternatives
+        if vehicle.vehicle_class is not VehicleClass.SPAA
+        and lineup_br is not None
+        and battle_rating <= lineup_br
+        and br_step_distance(lineup_br, battle_rating) <= 2
+    )
+    pairs: list[list[str]] = []
+    pair_evidence: list[dict[str, Any]] = []
+    for index, first in enumerate(specialist):
+        for second in specialist[index + 1 :]:
+            distance = br_step_distance(
+                max(resolved_brs[first.vehicle_id], resolved_brs[second.vehicle_id]),
+                min(resolved_brs[first.vehicle_id], resolved_brs[second.vehicle_id]),
+            )
+            first_capabilities, first_complete = _specialist_capability_evidence(
+                first, capability_resolutions
+            )
+            second_capabilities, second_complete = _specialist_capability_evidence(
+                second, capability_resolutions
+            )
+            capability_difference = sorted(first_capabilities ^ second_capabilities)
+            performance_difference = _substantial_performance_difference(
+                first.vehicle_id, second.vehicle_id, statistics_by_vehicle or {}
+            )
+            redundant = (
+                distance <= 1
+                and first_complete
+                and second_complete
+                and not capability_difference
+                and not performance_difference
+                and bool(alternatives)
+                and not heavy_aa_requested
+            )
+            pair_evidence.append(
+                {
+                    "vehicles": [first.vehicle_id, second.vehicle_id],
+                    "br_step_distance": distance,
+                    "capability_difference": capability_difference,
+                    "capability_evidence_complete": first_complete and second_complete,
+                    "substantial_performance_difference": performance_difference,
+                    "redundant": redundant,
+                }
+            )
+            if redundant:
+                pairs.append([first.vehicle_id, second.vehicle_id])
+    return RuleResult(
+        rule="role_redundancy",
+        score=None,
+        effective_score=100.0,
+        status=RuleStatus.WARNING if pairs else RuleStatus.GOOD,
+        evidence={
+            "redundant_pairs": pairs,
+            "pair_evidence": pair_evidence,
+            "competitive_non_spaa_alternatives": alternatives,
+            "heavy_aa_requested": heavy_aa_requested,
+            "diagnostic_only": True,
+            "ruleset_id": config.ruleset_id,
+        },
+        warnings=("near-equivalent specialist redundancy",) if pairs else (),
+        explanation=(
+            "Near-equivalent specialist slots are diagnostic only; general-purpose duplicates "
+            "are exempt."
+        ),
+    )
+
+
+def _specialist_capability_evidence(
+    vehicle: Vehicle,
+    resolutions: CapabilityResolutionMap | None,
+) -> tuple[set[str], bool]:
+    relevant = (Capability.RADAR, Capability.IRST, Capability.SAM, Capability.AUTOCANNON_AA)
+    states = {
+        capability: _capability_state(vehicle, capability, resolutions)
+        for capability in relevant
+    }
+    present = {
+        capability.value for capability, state in states.items() if state == "present"
+    }
+    complete = all(state in {"present", "verified_absent"} for state in states.values())
+    return present, complete
+
+
+def _substantial_performance_difference(
+    first_id: str,
+    second_id: str,
+    observations: Mapping[str, VehicleStatistics],
+) -> bool:
+    first = observations.get(first_id)
+    second = observations.get(second_id)
+    if (
+        first is None
+        or second is None
+        or first.mode_scope is not StatisticsScope.GROUND_REALISTIC_GROUND_VEHICLES
+        or second.mode_scope is not first.mode_scope
+        or second.snapshot_id != first.snapshot_id
+        or first.battles is None
+        or second.battles is None
+        or min(first.battles, second.battles) < 1000
+    ):
+        return False
+    first_rate, _ = _metric_value(first, "win_rate")
+    second_rate, _ = _metric_value(second, "win_rate")
+    return (
+        first_rate is not None
+        and second_rate is not None
+        and abs(first_rate - second_rate) >= 0.05
     )
 
 
@@ -615,6 +956,9 @@ def evaluate_lineup_rules(
     statistics_by_vehicle: Mapping[str, VehicleStatistics] | None = None,
     peer_statistics: Sequence[PeerStatistic] = (),
     nearby_spaa: Sequence[tuple[Vehicle, VehicleStatus]] = (),
+    eligible_alternatives: Sequence[tuple[Vehicle, int]] = (),
+    capability_resolutions: CapabilityResolutionMap | None = None,
+    heavy_aa_requested: bool = False,
     ruleset: Ruleset | None = None,
 ) -> RulesEvaluation:
     """Evaluate each transparent component, composite score, and readiness gates."""
@@ -626,17 +970,36 @@ def evaluate_lineup_rules(
     if not vehicles:
         raise ValueError("a lineup must contain at least one vehicle")
     lineup_br = max(resolved_brs.values())
-    rules = (
+    base_rules: tuple[RuleResult, ...] = (
         br_cohesion_rule(resolved_brs, lineup_br, config),
         backup_depth_rule(resolved_brs, lineup_br, config),
-        role_coverage_rule(vehicles, config),
+        role_coverage_rule(
+            vehicles, config, capability_resolutions=capability_resolutions
+        ),
         anti_air_rule(vehicles, nearby_spaa, config),
-        scouting_rule(vehicles, config),
-        uptier_resilience_rule(vehicles, config),
+        scouting_rule(
+            vehicles, config, capability_resolutions=capability_resolutions
+        ),
+        uptier_resilience_rule(
+            vehicles, config, capability_resolutions=capability_resolutions
+        ),
         statistical_strength_rule(
             vehicles, resolved_brs, statistics_by_vehicle, peer_statistics, config
         ),
     )
+    rules: tuple[RuleResult, ...] = base_rules
+    if config.ruleset_id == "m2-capability-aware-v1":
+        rules += (
+            role_redundancy_rule(
+                vehicles,
+                resolved_brs,
+                eligible_alternatives=eligible_alternatives,
+                capability_resolutions=capability_resolutions,
+                statistics_by_vehicle=statistics_by_vehicle,
+                heavy_aa_requested=heavy_aa_requested,
+                ruleset=config,
+            ),
+        )
     weights = config.weights.model_dump()
     overall = sum(rule.effective_score * weights[rule.rule] for rule in rules)
     backup = next(rule for rule in rules if rule.rule == "backup_depth")

@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -12,14 +13,25 @@ from wt_advisor.data.models import (
 )
 from wt_advisor.data.providers.fixture import FixtureProvider
 from wt_advisor.domain.models import (
+    AcquisitionType,
+    CandidateGroup,
     DatasetType,
     GameMode,
     Nation,
+    PrerequisiteSemantics,
+    Researchability,
+    ResearchDomain,
+    ResearchEdge,
+    ResearchEdgeType,
+    ResolvedAvailability,
+    SnapshotPurpose,
     StatisticsScope,
+    TreeMembership,
     VehicleStatistics,
     VehicleStatus,
+    Visibility,
 )
-from wt_advisor.services.advisor import AdvisorService
+from wt_advisor.services.advisor import AdvisorService, _lower_alternative
 from wt_advisor.storage import EvidenceRepository, create_database
 
 
@@ -34,6 +46,141 @@ def test_generate_lineups_is_deterministic_and_grouped_by_br() -> None:
     assert first.groups
     assert all(group.candidates for group in first.groups)
     assert first.recommended is not None
+
+
+def test_targeted_generation_does_not_return_failed_target_as_lower_alternative() -> None:
+    service = AdvisorService.from_acceptance_fixture()
+    service._battle_ratings["us_m24"] = 40
+
+    result = service.generate_lineups(
+        profile_id="acceptance",
+        target_br=40,
+        top_n=3,
+        hypothetical_owned=frozenset({"us_m24"}),
+    )
+
+    assert [group.lineup_br for group in result.groups] == [40]
+    assert result.groups[0].candidates
+    assert all(
+        not candidate.analysis.readiness_passed
+        for candidate in result.groups[0].candidates
+    )
+    assert result.recommended is None
+    assert result.lower_br_alternative is None
+
+
+def test_lower_alternative_uses_valid_lower_frontier_after_failed_highest_frontier() -> None:
+    service = AdvisorService.from_acceptance_fixture()
+    candidate = service.generate_lineups(profile_id="acceptance", top_n=1).recommended
+    assert candidate is not None
+    valid_lower = candidate.model_copy(
+        update={"analysis": candidate.analysis.model_copy(update={"lineup_br": 37})}
+    )
+    failed_highest = candidate.model_copy(
+        update={
+            "analysis": candidate.analysis.model_copy(
+                update={"lineup_br": 40, "readiness_passed": False, "readiness_failures": ("test",)}
+            )
+        }
+    )
+    groups = (
+        CandidateGroup(lineup_br=37, candidates=(valid_lower,)),
+        CandidateGroup(lineup_br=40, candidates=(failed_highest,)),
+    )
+
+    assert _lower_alternative(groups, recommended=None, target_br=None) == groups[0]
+
+
+def test_lower_alternative_is_strictly_below_valid_recommendation_and_ready() -> None:
+    service = AdvisorService.from_acceptance_fixture()
+    candidate = service.generate_lineups(profile_id="acceptance", top_n=1).recommended
+    assert candidate is not None
+    lower = candidate.model_copy(
+        update={"analysis": candidate.analysis.model_copy(update={"lineup_br": 37})}
+    )
+    recommendation = candidate.model_copy(
+        update={"analysis": candidate.analysis.model_copy(update={"lineup_br": 40})}
+    )
+    groups = (
+        CandidateGroup(lineup_br=37, candidates=(lower,)),
+        CandidateGroup(lineup_br=40, candidates=(recommendation,)),
+    )
+
+    assert _lower_alternative(groups, recommended=recommendation, target_br=None) == groups[0]
+
+
+def test_lower_alternative_is_none_without_a_qualifying_lower_frontier() -> None:
+    service = AdvisorService.from_acceptance_fixture()
+    candidate = service.generate_lineups(profile_id="acceptance", top_n=1).recommended
+    assert candidate is not None
+    failed_lower = candidate.model_copy(
+        update={
+            "analysis": candidate.analysis.model_copy(
+                update={"lineup_br": 37, "readiness_passed": False, "readiness_failures": ("test",)}
+            )
+        }
+    )
+    recommendation = candidate.model_copy(
+        update={"analysis": candidate.analysis.model_copy(update={"lineup_br": 40})}
+    )
+    groups = (
+        CandidateGroup(lineup_br=37, candidates=(failed_lower,)),
+        CandidateGroup(lineup_br=40, candidates=(recommendation,)),
+    )
+
+    assert _lower_alternative(groups, recommended=recommendation, target_br=None) is None
+
+
+def test_data_status_exposes_independent_milestone_two_components() -> None:
+    status = AdvisorService.from_acceptance_fixture().data_status()
+
+    assert set(status["components"]) == {
+        "vehicle_metadata",
+        "capabilities",
+        "availability",
+        "identity_aliases",
+        "research_graph",
+        "global_statistics",
+    }
+    assert status["components"]["vehicle_metadata"]["status"] == "available"
+    assert status["components"]["research_graph"]["status"] == "available"
+    assert status["components"]["global_statistics"]["status"] == "available"
+    assert status["active"]["bundle_id"]
+
+
+def test_statistics_inspection_is_read_only_and_resolves_provider_ids(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "statistics.json"
+    source.write_text(
+        json.dumps(
+            [
+                {
+                    "source_vehicle_id": "us_m3_lee",
+                    "mode_scope": "ground_realistic_ground_vehicles",
+                    "sample_start": "2026-09-01",
+                    "sample_end": "2026-09-18",
+                    "battles": 10,
+                    "wins": 5,
+                    "losses": 5,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    service = AdvisorService.from_acceptance_fixture()
+
+    inspection = service.inspect_statistics(
+        source, provider="manual-test", purpose=SnapshotPurpose.OPERATIONAL
+    )
+
+    assert inspection.valid is True
+    assert inspection.matched_rows == 1
+    assert inspection.canonical_match_rate == 1.0
+    assert inspection.prospective_snapshot_id.startswith("statistics-")
+    assert service.get_vehicle_statistics("us_m3_lee")[0].snapshot_id == (
+        "fixture-usa-ground-rb-statistics-m1"
+    )
 
 
 def test_generation_excludes_premium_event_and_unowned_vehicles() -> None:
@@ -131,6 +278,77 @@ def test_evaluate_next_unlocks_includes_forced_lineup() -> None:
 
     assert "us_m3_lee" in m3_lee.forced_include.analysis.lineup.slots
     assert m3_lee.research_cost > 0
+    assert m3_lee.current_status is VehicleStatus.RESEARCHING
+    assert m3_lee.research_prerequisites == ("us_m2a4_1st",)
+    assert m3_lee.prerequisite_statuses == {"us_m2a4_1st": VehicleStatus.OWNED}
+    assert m3_lee.resulting_br == m3_lee.expanded_best.analysis.lineup_br
+    assert m3_lee.readiness_before is m3_lee.before.analysis.readiness_passed
+    assert m3_lee.readiness_expanded is m3_lee.expanded_best.analysis.readiness_passed
+    assert m3_lee.readiness_forced is m3_lee.forced_include.analysis.readiness_passed
+    assert m3_lee.adopted_immediately is m3_lee.adopted
+    assert m3_lee.graph_snapshot_id is not None
+
+
+def test_directly_researchable_requires_every_incoming_prerequisite() -> None:
+    service = AdvisorService.from_acceptance_fixture()
+    service._research_edges = (
+        ("us_m2a4_first_tank_div", "us_m3_lee"),
+        ("us_m2a4_1st", "us_m3_lee"),
+    )
+
+    assert "us_m3_lee" not in service._directly_researchable()
+
+    service.set_user_vehicle_status(
+        "acceptance", "us_m2a4_first_tank_div", VehicleStatus.OWNED
+    )
+
+    assert "us_m3_lee" in service._directly_researchable()
+
+
+def test_directly_researchable_supports_any_prerequisite_groups() -> None:
+    service = AdvisorService.from_acceptance_fixture()
+    service._research_edges = (
+        ResearchEdge(
+            nation=Nation.USA,
+            domain=ResearchDomain.GROUND,
+            parent_vehicle_id="us_m2a4_first_tank_div",
+            child_vehicle_id="us_m3_lee",
+            edge_type=ResearchEdgeType.BRANCH_UNLOCK,
+            prerequisite_group="branch-choice",
+            prerequisite_semantics=PrerequisiteSemantics.ANY,
+            snapshot_id="graph-test",
+        ),
+        ResearchEdge(
+            nation=Nation.USA,
+            domain=ResearchDomain.GROUND,
+            parent_vehicle_id="us_m2a4_1st",
+            child_vehicle_id="us_m3_lee",
+            edge_type=ResearchEdgeType.BRANCH_UNLOCK,
+            prerequisite_group="branch-choice",
+            prerequisite_semantics=PrerequisiteSemantics.ANY,
+            snapshot_id="graph-test",
+        ),
+    )
+
+    assert "us_m3_lee" in service._directly_researchable()
+
+
+def test_directly_researchable_requires_resolved_normal_researchability() -> None:
+    service = AdvisorService.from_acceptance_fixture()
+    unresolved = ResolvedAvailability(
+        vehicle_id="us_m3_lee",
+        acquisition_type=AcquisitionType.UNKNOWN,
+        researchability=Researchability.UNKNOWN,
+        tree_membership=TreeMembership.UNKNOWN,
+        visibility=Visibility.UNKNOWN,
+        source_snapshot_id="availability-test",
+        source_provider="test",
+        source_reference="test-record",
+        reason="no verified acquisition classification",
+    )
+    service._resolved_availability = {"us_m3_lee": unresolved}
+
+    assert "us_m3_lee" not in service._directly_researchable()
 
 
 def test_profile_mutation_is_idempotent_and_revisioned() -> None:
@@ -173,6 +391,52 @@ def test_database_factory_persists_profile_status(tmp_path: Path) -> None:
 
     status = reopened.get_user_progress("acceptance").vehicle_statuses["us_m3_lee"]
     assert status is VehicleStatus.OWNED
+
+
+def test_profile_reconciliation_dry_run_then_apply_is_audited_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "advisor.sqlite"
+    AdvisorService.from_database(database)
+    fixture = FixtureProvider().load()
+    aliases = (
+        {
+            "provider": "test-aliases",
+            "source_vehicle_id": "us_m2a4_first_tank_div",
+            "deprecated_vehicle_id": "us_m2a4_first_tank_div",
+            "canonical_vehicle_id": "us_m2a4_1st",
+            "confirmed": True,
+            "source_reference": "test-confirmed-alias",
+        },
+    )
+    raw_content = canonical_bytes(aliases)
+    snapshot = RawDatasetMetadata(
+        snapshot_id="identity-test-v1",
+        dataset_type=DatasetType.IDENTITY_ALIASES,
+        provider="test-aliases",
+        retrieved_at=datetime(2026, 9, 19, tzinfo=UTC),
+        purpose=fixture.vehicles.snapshot.purpose,
+        compatibility_key=fixture.vehicles.snapshot.compatibility_key,
+    ).snapshot(raw_content)
+    EvidenceRepository(create_database(database)).import_identity_snapshot(
+        snapshot, aliases, raw_content=raw_content
+    )
+    service = AdvisorService.from_database(database)
+
+    preview = service.reconcile_profile("acceptance")
+    applied = service.reconcile_profile(
+        "acceptance", apply=True, expected_revision=preview.plan.expected_revision
+    )
+    repeated = service.reconcile_profile("acceptance")
+
+    assert preview.applied is False
+    assert preview.plan.items[0].chosen_status is VehicleStatus.OWNED
+    assert applied.applied is True
+    assert "us_m2a4_first_tank_div" not in service.get_user_progress(
+        "acceptance"
+    ).vehicle_statuses
+    assert repeated.plan.already_applied is True
+    assert repeated.plan.items == ()
 
 
 def test_database_factory_activates_latest_imported_vehicle_snapshot(tmp_path: Path) -> None:

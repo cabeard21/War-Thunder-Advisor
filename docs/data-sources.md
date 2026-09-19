@@ -4,6 +4,37 @@ Reviewed 2026-09-18. These notes distinguish provider evidence from the
 independently curated acceptance fixture. Fixture values are test inputs, not a
 claim that they are the current live-game values.
 
+## Milestone 2 acquisition boundary
+
+The War Thunder Vehicles community API remains the only automated remote
+vehicle-data source. Milestone 2 may use its list and per-vehicle detail routes,
+but does not crawl Gaijin or War Thunder Wiki pages. Manual JSON, YAML, and CSV
+imports may cite official pages when every record retains its own source and
+reference.
+
+The upstream API source was rechecked at revision
+`ac07d5364ee4dc09af91514be0c1b80e0c6699ad`. Its per-vehicle response exposes
+`required_vehicle`, modification names/icons, `gun_stabilizer`, `has_ess`, and
+weapon/ammunition details. Automated capability normalization is deliberately
+narrow:
+
+- scouting, artillery, smoke, and vertical stabilization require explicit
+  provider fields or modification identifiers;
+- a missing field is unknown, not false;
+- high-caliber HE is not inferred from a locally invented caliber threshold;
+- prerequisite edges are imported only when the provider supplies an explicit
+  required vehicle.
+
+The upstream implementation is GPL-3.0, but its data ultimately derives from
+game files. Gaijin's current terms restrict database and AI-related uses of its
+services/content without permission. This project therefore records terms and
+source revisions, does not automate official-site extraction, and keeps manual
+evidence auditable. This is an engineering boundary, not legal advice.
+
+StatShark remains manual-import-only for Milestone 2. A documented user export
+may be inspected and imported, but the application will not automate browser
+scraping, bypass anti-bot controls, or call undocumented endpoints.
+
 ## War Thunder Vehicles community API
 
 - Project: <https://github.com/Sgambe33/WarThunder-Vehicles-API>

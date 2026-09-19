@@ -6,7 +6,7 @@ import json
 from datetime import date, datetime
 from enum import StrEnum
 from hashlib import sha256
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Self, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -41,10 +41,43 @@ class AvailabilityType(StrEnum):
     PACK = "pack"
 
 
+class AcquisitionType(StrEnum):
+    RESEARCH = "research"
+    RESERVE = "reserve"
+    PREMIUM = "premium"
+    PACK = "pack"
+    EVENT = "event"
+    GIFT = "gift"
+    SQUADRON = "squadron"
+    MARKETPLACE = "marketplace"
+    UNKNOWN = "unknown"
+
+
+class Researchability(StrEnum):
+    NORMALLY_RESEARCHABLE = "normally_researchable"
+    NON_RESEARCHABLE = "non_researchable"
+    UNKNOWN = "unknown"
+
+
+class TreeMembership(StrEnum):
+    MAIN_TREE = "main_tree"
+    FOLDERED = "foldered"
+    NONE = "none"
+    UNKNOWN = "unknown"
+
+
+class Visibility(StrEnum):
+    VISIBLE = "visible"
+    HIDDEN = "hidden"
+    LEGACY = "legacy"
+    UNKNOWN = "unknown"
+
+
 class Capability(StrEnum):
     SCOUTING = "scouting"
     ARTILLERY = "artillery"
     STABILIZER = "stabilizer"
+    VERTICAL_STABILIZER = "vertical_stabilizer"
     RADAR = "radar"
     IRST = "irst"
     SAM = "sam"
@@ -55,6 +88,20 @@ class Capability(StrEnum):
     THERMALS = "thermals"
     ATGM = "atgm"
     HIGH_CALIBER_HE = "high_caliber_he"
+
+
+class CapabilityState(StrEnum):
+    PRESENT = "present"
+    VERIFIED_ABSENT = "verified_absent"
+    UNKNOWN = "unknown"
+    CONFLICTED = "conflicted"
+
+
+class CapabilitySourceType(StrEnum):
+    COMMUNITY_API = "community_api"
+    OFFICIAL_REFERENCE = "official_reference"
+    CURATED_IMPORT = "curated_import"
+    OTHER = "other"
 
 
 class Role(StrEnum):
@@ -98,6 +145,10 @@ class DatasetType(StrEnum):
     TECH_TREE = "tech_tree"
     GLOBAL_STATISTICS = "global_statistics"
     CURATED_OVERRIDES = "curated_overrides"
+    CAPABILITIES = "capabilities"
+    AVAILABILITY = "availability"
+    IDENTITY_ALIASES = "identity_aliases"
+    RESEARCH_GRAPH = "research_graph"
 
 
 class SnapshotPurpose(StrEnum):
@@ -110,6 +161,36 @@ class StatisticsScope(StrEnum):
     REALISTIC_ALL_CONTEXTS = "realistic_all_contexts"
     AIR_REALISTIC = "air_realistic"
     UNKNOWN_REALISTIC_SCOPE = "unknown_realistic_scope"
+
+
+class RatioProvenance(StrEnum):
+    DERIVED_FROM_COUNTS = "derived_from_counts"
+    PROVIDER_REPORTED = "provider_reported"
+    REPORTED = "provider_reported"
+    UNAVAILABLE = "unavailable"
+
+
+class ResearchDomain(StrEnum):
+    GROUND = "ground"
+
+
+class ResearchEdgeType(StrEnum):
+    NORMAL = "normal"
+    FOLDER = "folder"
+    BRANCH_UNLOCK = "branch_unlock"
+    REQUIRED_PREDECESSOR = "required_predecessor"
+
+
+class PrerequisiteSemantics(StrEnum):
+    ALL = "all"
+    ANY = "any"
+
+
+class ComponentStatus(StrEnum):
+    AVAILABLE = "available"
+    STALE = "stale"
+    INCOMPATIBLE = "incompatible"
+    UNAVAILABLE = "unavailable"
 
 
 BR_LADDER: tuple[int, ...] = tuple(
@@ -141,6 +222,121 @@ class Vehicle(FrozenModel):
     capabilities: frozenset[Capability] = frozenset()
 
 
+class CapabilityObservation(FrozenModel):
+    vehicle_id: str = Field(min_length=1, pattern=r"^[a-z0-9_]+$")
+    capability: Capability
+    value: bool
+    source_provider: str = Field(min_length=1)
+    source_snapshot_id: str = Field(min_length=1)
+    source_reference: str = Field(min_length=1)
+    source_type: CapabilitySourceType
+    confidence: float | None = Field(default=None, ge=0, le=1)
+
+
+class CapabilityResolution(FrozenModel):
+    vehicle_id: str = Field(min_length=1, pattern=r"^[a-z0-9_]+$")
+    capability: Capability
+    state: CapabilityState
+    observations: tuple[CapabilityObservation, ...] = ()
+
+    @property
+    def status(self) -> CapabilityState:
+        """Compatibility name used by storage and transport DTOs."""
+
+        return self.state
+
+    @classmethod
+    def from_observations(
+        cls,
+        vehicle_id: str,
+        capability: Capability,
+        observations: tuple[CapabilityObservation, ...],
+    ) -> Self:
+        if any(
+            row.vehicle_id != vehicle_id or row.capability is not capability
+            for row in observations
+        ):
+            raise ValueError(
+                "capability observations must match the resolved vehicle and capability"
+            )
+        values = {row.value for row in observations}
+        if values == {True}:
+            state = CapabilityState.PRESENT
+        elif values == {False}:
+            state = CapabilityState.VERIFIED_ABSENT
+        elif values == {False, True}:
+            state = CapabilityState.CONFLICTED
+        else:
+            state = CapabilityState.UNKNOWN
+        return cls(
+            vehicle_id=vehicle_id,
+            capability=capability,
+            state=state,
+            observations=observations,
+        )
+
+
+class ResolvedAvailability(FrozenModel):
+    vehicle_id: str = Field(min_length=1, pattern=r"^[a-z0-9_]+$")
+    acquisition_type: AcquisitionType
+    researchability: Researchability
+    tree_membership: TreeMembership
+    visibility: Visibility
+    source_snapshot_id: str = Field(min_length=1)
+    source_provider: str = Field(min_length=1)
+    source_reference: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    provider_observation: str | None = None
+
+
+class ResearchEdge(FrozenModel):
+    nation: Nation
+    domain: ResearchDomain
+    parent_vehicle_id: str = Field(min_length=1, pattern=r"^[a-z0-9_]+$")
+    child_vehicle_id: str = Field(min_length=1, pattern=r"^[a-z0-9_]+$")
+    edge_type: ResearchEdgeType
+    prerequisite_group: str = Field(min_length=1)
+    prerequisite_semantics: PrerequisiteSemantics = PrerequisiteSemantics.ALL
+    snapshot_id: str = Field(min_length=1)
+
+    @property
+    def group_semantics(self) -> PrerequisiteSemantics:
+        """Compatibility name matching the persisted column."""
+
+        return self.prerequisite_semantics
+
+    @model_validator(mode="after")
+    def valid_edge(self) -> ResearchEdge:
+        if self.parent_vehicle_id == self.child_vehicle_id:
+            raise ValueError("research edge cannot reference itself")
+        return self
+
+
+class ComponentDataStatus(FrozenModel):
+    dataset_type: DatasetType
+    status: ComponentStatus
+    selected_snapshot_id: str | None = None
+    newest_snapshot_id: str | None = None
+    provider: str | None = None
+    purpose: SnapshotPurpose
+    freshness: Freshness
+    compatible: bool
+    reason: str | None = None
+    total_count: int = Field(default=0, ge=0)
+    covered_count: int = Field(default=0, ge=0)
+    coverage_percent: float = Field(default=0, ge=0, le=100)
+    gaps: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def valid_coverage(self) -> ComponentDataStatus:
+        if self.covered_count > self.total_count:
+            raise ValueError("covered_count must not exceed total_count")
+        expected = 0.0 if self.total_count == 0 else self.covered_count / self.total_count * 100
+        if abs(expected - self.coverage_percent) > 0.01:
+            raise ValueError("coverage_percent must match covered_count and total_count")
+        return self
+
+
 class VehicleStatistics(FrozenModel):
     vehicle_id: str
     snapshot_id: str
@@ -155,6 +351,10 @@ class VehicleStatistics(FrozenModel):
     ground_kills: int | None = Field(default=None, ge=0)
     air_kills: int | None = Field(default=None, ge=0)
     deaths: int | None = Field(default=None, ge=0)
+    reported_win_rate: float | None = Field(default=None, ge=0, le=1)
+    reported_kd: float | None = Field(default=None, ge=0)
+    reported_kills_per_battle: float | None = Field(default=None, ge=0)
+    ratio_provenance: RatioProvenance | None = None
 
     @model_validator(mode="after")
     def consistent_observation(self) -> VehicleStatistics:
@@ -178,7 +378,89 @@ class VehicleStatistics(FrozenModel):
                 observed_rate = self.wins / self.battles
                 if abs(observed_rate - self.win_rate) > 0.01:
                     raise ValueError("win_rate is inconsistent with wins and battles")
+            if (
+                self.battles > 0
+                and self.wins is not None
+                and self.reported_win_rate is not None
+                and abs(self.wins / self.battles - self.reported_win_rate) > 0.01
+            ):
+                raise ValueError("reported_win_rate is inconsistent with wins and battles")
+            if (
+                self.battles > 0
+                and self.kills is not None
+                and self.reported_kills_per_battle is not None
+                and abs(self.kills / self.battles - self.reported_kills_per_battle) > 0.01
+            ):
+                raise ValueError(
+                    "reported_kills_per_battle is inconsistent with kills and battles"
+                )
+        if (
+            self.deaths is not None
+            and self.deaths > 0
+            and self.kills is not None
+            and self.reported_kd is not None
+            and abs(self.kills / self.deaths - self.reported_kd) > 0.01
+        ):
+            raise ValueError("reported_kd is inconsistent with kills and deaths")
         return self
+
+    @property
+    def derived_win_rate(self) -> float | None:
+        if self.battles and self.wins is not None:
+            return self.wins / self.battles
+        return None
+
+    @property
+    def derived_kd(self) -> float | None:
+        if self.deaths and self.kills is not None:
+            return self.kills / self.deaths
+        return None
+
+    @property
+    def derived_kills_per_battle(self) -> float | None:
+        if self.battles and self.kills is not None:
+            return self.kills / self.battles
+        return None
+
+    def ratio_source(self, metric: str) -> RatioProvenance:
+        derived = {
+            "win_rate": self.derived_win_rate,
+            "kd": self.derived_kd,
+            "kills_per_battle": self.derived_kills_per_battle,
+        }
+        reported = {
+            "win_rate": (
+                self.reported_win_rate
+                if self.reported_win_rate is not None
+                else self.win_rate
+            ),
+            "kd": self.reported_kd,
+            "kills_per_battle": self.reported_kills_per_battle,
+        }
+        if metric not in derived:
+            raise ValueError(f"unsupported ratio metric: {metric}")
+        if derived[metric] is not None:
+            return RatioProvenance.DERIVED_FROM_COUNTS
+        if reported[metric] is not None:
+            return RatioProvenance.REPORTED
+        return RatioProvenance.UNAVAILABLE
+
+
+class StatisticsInspection(FrozenModel):
+    valid: bool
+    recognized_columns: tuple[str, ...]
+    unknown_columns: tuple[str, ...] = ()
+    total_rows: int = Field(ge=0)
+    matched_rows: int = Field(ge=0)
+    canonical_match_rate: float = Field(ge=0, le=1)
+    unresolved_source_ids: tuple[str, ...] = ()
+    duplicate_observations: tuple[str, ...] = ()
+    scopes: tuple[StatisticsScope, ...] = ()
+    sample_start: date | None = None
+    sample_end: date | None = None
+    metric_coverage: dict[str, float] = Field(default_factory=dict)
+    prospective_snapshot_id: str
+    errors: tuple[str, ...] = ()
 
 
 class SnapshotRef(FrozenModel):
@@ -305,6 +587,21 @@ class UnlockEvaluation(FrozenModel):
     cross_br: bool
     overall_delta: float | None
     component_deltas: dict[str, float]
+    current_status: VehicleStatus = VehicleStatus.UNKNOWN
+    research_prerequisites: tuple[str, ...] = ()
+    prerequisite_statuses: dict[str, VehicleStatus] = Field(default_factory=dict)
+    graph_snapshot_id: str | None = None
+    resulting_br: int | None = None
+    readiness_before: bool | None = None
+    readiness_expanded: bool | None = None
+    readiness_forced: bool | None = None
+    readiness_changes: tuple[str, ...] = ()
+    role_changes: tuple[str, ...] = ()
+    adopted_immediately: bool = False
+    opens_new_ready_frontier: bool = False
+    improves_existing_frontier: bool = False
+    fills_missing_role: bool = False
+    provides_stronger_backup: bool = False
 
 
 class UserProgress(FrozenModel):
@@ -319,6 +616,31 @@ class VehicleStatusChange(FrozenModel):
     before_status: VehicleStatus
     after_status: VehicleStatus
     revision: str
+
+
+class ReconciliationItem(FrozenModel):
+    deprecated_vehicle_id: str = Field(min_length=1)
+    canonical_vehicle_id: str = Field(min_length=1)
+    deprecated_status: VehicleStatus
+    canonical_status: VehicleStatus
+    chosen_status: VehicleStatus
+    reason: str = Field(min_length=1)
+    collision: bool
+
+
+class ReconciliationPlan(FrozenModel):
+    profile_id: str = Field(min_length=1)
+    expected_revision: str = Field(min_length=1)
+    alias_revision: str = Field(min_length=1)
+    items: tuple[ReconciliationItem, ...]
+    plan_id: str = Field(min_length=1)
+    already_applied: bool = False
+
+
+class ReconciliationResult(FrozenModel):
+    plan: ReconciliationPlan
+    applied: bool
+    resulting_revision: str | None = None
 
 
 T = TypeVar("T")

@@ -1,0 +1,56 @@
+{
+  "revision": "usa-ground-rb-m2-quality-v1",
+  "evidence_notes": [
+    "Scenarios reuse the frozen Milestone 1 vehicle and statistics records.",
+    "Capability observations are independent acceptance evidence; omitted facts remain unknown.",
+    "Expected results are properties, not exact lineup IDs."
+  ],
+  "capability_observations": [
+    {"vehicle_id":"us_m24","capability":"scouting","source_reference":"acceptance:m24#scouting"},
+    {"vehicle_id":"us_m24","capability":"vertical_stabilizer","source_reference":"acceptance:m24#vertical-stabilizer"},
+    {"vehicle_id":"us_m24","capability":"smoke","source_reference":"acceptance:m24#smoke"},
+    {"vehicle_id":"us_m24","capability":"artillery","source_reference":"acceptance:m24#artillery"},
+    {"vehicle_id":"us_m16_mgmc","capability":"autocannon_aa","source_reference":"acceptance:m16#autocannon-aa"},
+    {"vehicle_id":"us_m13_mgmc","capability":"autocannon_aa","source_reference":"acceptance:m13#autocannon-aa"},
+    {"vehicle_id":"us_m15_cgmc","capability":"autocannon_aa","source_reference":"acceptance:m15#autocannon-aa"},
+    {"vehicle_id":"us_m4a3_105","capability":"high_caliber_he","source_reference":"acceptance:m4a3-105#high-caliber-he"}
+  ],
+  "scenarios": [
+    {
+      "id": "rank_i_current",
+      "owned": ["us_m2a4","us_m2a4_1st","us_m3_stuart","us_m3a1_stuart","us_m22","us_m3_gmc","us_m13_mgmc","us_m15_cgmc"],
+      "researching": ["us_m3_lee"],
+      "expected_properties": ["ready_recommendation","no_inaccessible_vehicle","spaa_redundancy_diagnostic_only","scouting_not_verified_absent"]
+    },
+    {
+      "id": "m3_lee_newly_owned",
+      "owned": ["us_m2a4","us_m2a4_1st","us_m3_stuart","us_m3a1_stuart","us_m22","us_m3_gmc","us_m13_mgmc","us_m15_cgmc","us_m3_lee"],
+      "researching": [],
+      "expected_properties": ["forced_include_contains_m3_lee","cross_br_comparison_labeled","lower_br_alternative_retained"]
+    },
+    {
+      "id": "coherent_2_7",
+      "owned": ["us_m2a4","us_m2a4_1st","us_m3_stuart","us_m3a1_stuart","us_m22","us_m3_gmc","us_m13_mgmc","us_m15_cgmc","us_m5a1","us_m3_lee","us_m16_mgmc"],
+      "researching": [],
+      "expected_properties": ["ready_2_7_frontier","single_spaa_sufficient"]
+    },
+    {
+      "id": "isolated_higher_br",
+      "owned": ["us_m2a4","us_m3_stuart","us_m3a1_stuart","us_m22","us_m3_gmc","us_m13_mgmc","us_m4a3_105"],
+      "researching": [],
+      "expected_properties": ["premature_escalation_not_recommended","higher_br_frontier_visible"]
+    },
+    {
+      "id": "mature_3_3",
+      "owned": ["us_m5a1","us_m3_lee","us_m16_mgmc","us_m4a3_105","us_m10_gmc","us_m4a1"],
+      "researching": [],
+      "expected_properties": ["ready_3_3_frontier","role_diversity"]
+    },
+    {
+      "id": "mature_3_7",
+      "owned": ["us_m5a1","us_m16_mgmc","us_m4a3_105","us_m10_gmc","us_m4a1","us_m4","us_m24"],
+      "researching": [],
+      "expected_properties": ["ready_3_7_frontier","m24_scouting_present","m24_vertical_stabilizer_present","general_medium_overlap_not_penalized"]
+    }
+  ]
+}

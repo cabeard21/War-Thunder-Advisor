@@ -19,8 +19,7 @@ ACCEPTANCE_SNAPSHOT_IDS = (
 
 def upgrade() -> None:
     existing = {
-        column["name"]
-        for column in sa.inspect(op.get_bind()).get_columns("data_snapshots")
+        column["name"] for column in sa.inspect(op.get_bind()).get_columns("data_snapshots")
     }
     if "purpose" not in existing:
         op.add_column(
@@ -49,8 +48,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     existing = {
-        column["name"]
-        for column in sa.inspect(op.get_bind()).get_columns("data_snapshots")
+        column["name"] for column in sa.inspect(op.get_bind()).get_columns("data_snapshots")
     }
     if "compatibility_key" in existing:
         op.drop_column("data_snapshots", "compatibility_key")

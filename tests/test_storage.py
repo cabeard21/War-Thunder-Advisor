@@ -5,6 +5,7 @@ from hashlib import sha256
 from pathlib import Path
 
 import pytest
+from alembic import command
 from sqlalchemy import Engine, func, inspect, select
 
 from wt_advisor.data.providers.fixture import FixtureProvider
@@ -21,10 +22,14 @@ from wt_advisor.domain.models import (
     VehicleClass,
     VehicleStatus,
 )
-from wt_advisor.storage.db import create_database
+from wt_advisor.storage.db import _alembic_config, build_engine, create_database
 from wt_advisor.storage.models import (
+    CapabilityObservationRow,
     DataSnapshotRow,
+    ImportAttemptRow,
+    ProfileReconciliationAuditRow,
     RawArtifactRow,
+    UserVehicleStateRow,
     VehicleBattleRatingRow,
     VehicleMetadataRow,
     VehicleStatisticsRow,
@@ -83,16 +88,46 @@ def test_create_database_runs_baseline_migration(tmp_path: Path) -> None:
         "override_entries",
         "user_profiles",
         "user_vehicle_states",
+        "capability_observations",
+        "availability_observations",
+        "vehicle_identity_aliases",
+        "research_graph_edges",
+        "import_attempts",
+        "profile_reconciliation_audits",
+        "profile_reconciliation_items",
+        "statistics_import_diagnostics",
     }
+
+
+def test_milestone_one_0002_database_upgrades_without_losing_rows(tmp_path: Path) -> None:
+    engine = build_engine(tmp_path / "upgrade.sqlite")
+    config = _alembic_config(engine)
+    command.upgrade(config, "0002")
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO user_profiles "
+            "(profile_id, nation, preferred_mode, crew_slots, include_premiums, "
+            "include_event_vehicles, include_pack_vehicles, revision) "
+            "VALUES ('kept', 'usa', 'ground_realistic', 5, 0, 0, 0, 0)"
+        )
+    assert "capability_observations" not in inspect(engine).get_table_names()
+
+    command.upgrade(config, "head")
+
+    assert "capability_observations" in inspect(engine).get_table_names()
+    with engine.connect() as connection:
+        assert (
+            connection.exec_driver_sql("SELECT profile_id FROM user_profiles").scalar_one()
+            == "kept"
+        )
+    engine.dispose()
 
 
 def test_vehicle_snapshot_import_is_idempotent_and_preserves_raw_artifact(
     database: tuple[Engine, EvidenceRepository],
 ) -> None:
     engine, repository = database
-    metadata_snapshot = snapshot(
-        "vehicles-r1", DatasetType.VEHICLE_METADATA, b'{"revision":"r1"}'
-    )
+    metadata_snapshot = snapshot("vehicles-r1", DatasetType.VEHICLE_METADATA, b'{"revision":"r1"}')
     result_one = repository.import_vehicle_snapshot(
         metadata_snapshot,
         [m3_lee()],
@@ -189,12 +224,18 @@ def test_explicit_snapshot_queries_do_not_mix_versions(
 
     assert first is not None and first.name == "M3 Lee"
     assert second is not None and second.name == "M3 Medium Tank"
-    assert repository.resolve_battle_rating(
-        "us_m3_lee", GameMode.GROUND_REALISTIC, snapshot_id="vehicles-r1"
-    ).value == 27
-    assert repository.resolve_battle_rating(
-        "us_m3_lee", GameMode.GROUND_REALISTIC, snapshot_id="vehicles-r2"
-    ).value == 30
+    assert (
+        repository.resolve_battle_rating(
+            "us_m3_lee", GameMode.GROUND_REALISTIC, snapshot_id="vehicles-r1"
+        ).value
+        == 27
+    )
+    assert (
+        repository.resolve_battle_rating(
+            "us_m3_lee", GameMode.GROUND_REALISTIC, snapshot_id="vehicles-r2"
+        ).value
+        == 30
+    )
     engine.dispose()
 
 
@@ -282,6 +323,254 @@ def test_statistics_import_preserves_nulls_and_scope(
     engine.dispose()
 
 
+def test_capability_observations_preserve_negative_unknown_and_conflict(
+    database: tuple[Engine, EvidenceRepository],
+) -> None:
+    engine, repository = database
+    repository.import_vehicle_snapshot(
+        snapshot("vehicles-r1", DatasetType.VEHICLE_METADATA, b"vehicles"),
+        [m3_lee()],
+        raw_content=b"vehicles",
+    )
+    capability_snapshot = snapshot("capabilities-r1", DatasetType.CAPABILITIES, b"capabilities")
+
+    repository.import_capability_snapshot(
+        capability_snapshot,
+        [
+            {
+                "vehicle_id": "us_m3_lee",
+                "capability": "scouting",
+                "value": False,
+                "source_reference": "manual:one",
+                "confidence": 0.9,
+            },
+            {
+                "vehicle_id": "us_m3_lee",
+                "capability": "scouting",
+                "value": True,
+                "source_reference": "manual:two",
+                "confidence": 0.8,
+            },
+        ],
+        raw_content=b"capabilities",
+    )
+
+    resolution = repository.resolve_capabilities("us_m3_lee", snapshot_id="capabilities-r1")
+
+    assert resolution[Capability.SCOUTING].state == "conflicted"
+    assert Capability.SMOKE not in resolution
+    with repository.session() as session:
+        observations = tuple(session.scalars(select(CapabilityObservationRow)))
+        assert {item.value for item in observations} == {True, False}
+    engine.dispose()
+
+
+def test_independent_evidence_imports_validate_identity_and_preserve_graph_semantics(
+    database: tuple[Engine, EvidenceRepository],
+) -> None:
+    engine, repository = database
+    parent = m3_lee()
+    child = parent.model_copy(
+        update={
+            "vehicle_id": "us_m4a1",
+            "source_vehicle_id": "us_m4a1_source",
+            "name": "M4A1",
+        }
+    )
+    repository.import_vehicle_snapshot(
+        snapshot("vehicles-r1", DatasetType.VEHICLE_METADATA, b"vehicles"),
+        [parent, child],
+        raw_content=b"vehicles",
+    )
+    repository.import_availability_snapshot(
+        snapshot("availability-r1", DatasetType.AVAILABILITY, b"availability"),
+        [
+            {
+                "vehicle_id": "us_m4a1",
+                "acquisition_type": "research",
+                "researchability": "normally_researchable",
+                "tree_membership": "main_tree",
+                "visibility": "visible",
+                "source_reference": "manual:tree",
+                "confidence": 1.0,
+            }
+        ],
+        raw_content=b"availability",
+    )
+    repository.import_research_graph_snapshot(
+        snapshot("graph-r1", DatasetType.RESEARCH_GRAPH, b"graph"),
+        [
+            {
+                "nation": "usa",
+                "domain": "ground",
+                "parent_vehicle_id": "us_m3_lee",
+                "child_vehicle_id": "us_m4a1",
+                "edge_type": "branch_unlock",
+                "prerequisite_group": "main",
+                "group_semantics": "all",
+            }
+        ],
+        raw_content=b"graph",
+    )
+
+    availability = repository.get_resolved_availability("us_m4a1", snapshot_id="availability-r1")
+    edges = repository.list_research_graph_edges(snapshot_id="graph-r1")
+
+    assert availability is not None
+    assert availability.researchability == "normally_researchable"
+    assert edges[0].edge_type == "branch_unlock"
+    assert edges[0].prerequisite_semantics == "all"
+    with pytest.raises(ValueError, match="unknown vehicle"):
+        repository.import_research_graph_snapshot(
+            snapshot("graph-bad", DatasetType.RESEARCH_GRAPH, b"bad"),
+            [
+                {
+                    "nation": "usa",
+                    "domain": "ground",
+                    "parent_vehicle_id": "missing",
+                    "child_vehicle_id": "us_m4a1",
+                    "edge_type": "normal",
+                    "prerequisite_group": "main",
+                    "group_semantics": "all",
+                }
+            ],
+            raw_content=b"bad",
+        )
+    engine.dispose()
+
+
+def test_invalid_import_attempt_is_retained_without_activating_snapshot(
+    database: tuple[Engine, EvidenceRepository],
+) -> None:
+    engine, repository = database
+
+    result = repository.record_import_attempt(
+        dataset_type=DatasetType.CAPABILITIES,
+        provider="community",
+        raw_content=b'{"vehicles":[]}',
+        status="rejected",
+        error="empty vehicle collection",
+        attempted_at=datetime(2026, 9, 18, tzinfo=UTC),
+    )
+
+    assert result.created is True
+    assert repository.list_snapshots(DatasetType.CAPABILITIES) == ()
+    with repository.session() as session:
+        attempt = session.get(ImportAttemptRow, result.attempt_id)
+        assert attempt is not None
+        assert attempt.raw_checksum == sha256(b'{"vehicles":[]}').hexdigest()
+        assert attempt.error == "empty vehicle collection"
+    engine.dispose()
+
+
+def test_confirmed_alias_reconciliation_is_dry_run_transactional_and_idempotent(
+    database: tuple[Engine, EvidenceRepository],
+) -> None:
+    engine, repository = database
+    canonical = m3_lee()
+    deprecated = canonical.model_copy(
+        update={
+            "vehicle_id": "us_m3_lee_old",
+            "source_vehicle_id": "us_m3_lee_old_source",
+            "name": "M3 Lee Legacy",
+        }
+    )
+    repository.import_vehicle_snapshot(
+        snapshot("vehicles-r1", DatasetType.VEHICLE_METADATA, b"vehicles"),
+        [canonical, deprecated],
+        raw_content=b"vehicles",
+    )
+    repository.import_identity_snapshot(
+        snapshot("identity-r1", DatasetType.IDENTITY_ALIASES, b"identity"),
+        [
+            {
+                "provider": "fixture",
+                "source_vehicle_id": "us_m3_lee_old",
+                "canonical_vehicle_id": "us_m3_lee",
+                "deprecated_vehicle_id": "us_m3_lee_old",
+                "confirmed": True,
+                "source_reference": "manual:alias",
+            }
+        ],
+        raw_content=b"identity",
+    )
+    repository.create_profile(UserProfile(profile_id="default"))
+    repository.set_vehicle_status("default", "us_m3_lee", VehicleStatus.LOCKED)
+    repository.set_vehicle_status("default", "us_m3_lee_old", VehicleStatus.OWNED)
+    revision = repository.get_profile("default").revision  # type: ignore[union-attr]
+
+    preview = repository.reconcile_profile_aliases(
+        "default", identity_snapshot_id="identity-r1", expected_revision=revision, apply=False
+    )
+    assert preview.applied is False
+    assert preview.items[0].chosen_status is VehicleStatus.OWNED
+    assert repository.get_user_vehicle_states("default")["us_m3_lee"] is VehicleStatus.LOCKED
+
+    applied = repository.reconcile_profile_aliases(
+        "default", identity_snapshot_id="identity-r1", expected_revision=revision, apply=True
+    )
+    assert applied.applied is True
+    assert repository.get_user_vehicle_states("default") == {"us_m3_lee": VehicleStatus.OWNED}
+    repeated = repository.reconcile_profile_aliases(
+        "default",
+        identity_snapshot_id="identity-r1",
+        expected_revision=applied.resulting_revision,
+        apply=True,
+    )
+    assert repeated.changed is False
+    with repository.session() as session:
+        audits = tuple(session.scalars(select(ProfileReconciliationAuditRow)))
+        old_state = session.get(UserVehicleStateRow, ("default", "us_m3_lee_old"))
+        assert len(audits) == 1
+        assert old_state is not None and old_state.superseded is True
+    engine.dispose()
+
+
+def test_statistics_store_reported_ratios_and_import_diagnostics(
+    database: tuple[Engine, EvidenceRepository],
+) -> None:
+    engine, repository = database
+    repository.import_vehicle_snapshot(
+        snapshot("vehicles-r1", DatasetType.VEHICLE_METADATA, b"vehicles"),
+        [m3_lee()],
+        raw_content=b"vehicles",
+    )
+    stats_snapshot = snapshot("stats-r1", DatasetType.GLOBAL_STATISTICS, b"stats")
+
+    repository.import_statistics_snapshot(
+        stats_snapshot,
+        [
+            {
+                "vehicle_id": "us_m3_lee",
+                "mode_scope": "ground_realistic_ground_vehicles",
+                "battles": 10,
+                "wins": 5,
+                "kills": 15,
+                "deaths": 10,
+                "reported_win_rate": 0.5,
+                "reported_kd": 1.5,
+                "reported_kills_per_battle": 1.5,
+                "ratio_provenance": "provider_reported",
+            }
+        ],
+        raw_content=b"stats",
+        diagnostics={
+            "recognized_columns": ["vehicle_id", "wins"],
+            "unknown_columns": [],
+            "matched_count": 1,
+            "unresolved_source_ids": [],
+        },
+    )
+
+    stored = repository.get_vehicle_statistics("us_m3_lee", snapshot_id="stats-r1")[0]
+    diagnostics = repository.get_statistics_import_diagnostics("stats-r1")
+
+    assert stored.reported_kd == 1.5
+    assert stored.reported_kd == 1.5
+    assert diagnostics is not None and diagnostics.matched_count == 1
+    engine.dispose()
+
+
 def test_profile_status_updates_increment_revision_but_idempotent_write_does_not(
     database: tuple[Engine, EvidenceRepository],
 ) -> None:
@@ -294,9 +583,7 @@ def test_profile_status_updates_increment_revision_but_idempotent_write_does_not
     repository.create_profile(UserProfile(profile_id="default"))
 
     first = repository.set_vehicle_status("default", "us_m3_lee", VehicleStatus.RESEARCHING)
-    repeated = repository.set_vehicle_status(
-        "default", "us_m3_lee", VehicleStatus.RESEARCHING
-    )
+    repeated = repository.set_vehicle_status("default", "us_m3_lee", VehicleStatus.RESEARCHING)
     second = repository.set_vehicle_status("default", "us_m3_lee", VehicleStatus.OWNED)
 
     assert first.before is None
@@ -309,9 +596,7 @@ def test_profile_status_updates_increment_revision_but_idempotent_write_does_not
     assert second.profile_revision == 2
     stored_profile = repository.get_profile("default")
     assert stored_profile is not None and stored_profile.revision == 2
-    assert repository.get_user_vehicle_states("default") == {
-        "us_m3_lee": VehicleStatus.OWNED
-    }
+    assert repository.get_user_vehicle_states("default") == {"us_m3_lee": VehicleStatus.OWNED}
     engine.dispose()
 
 
@@ -349,9 +634,7 @@ def test_provider_datasets_can_be_imported_without_provider_storage_coupling(
         snapshot_id=vehicle_import.snapshot_id,
     )
     assert resolved.value == bundle.battle_ratings["us_m3_lee"]
-    assert repository.get_vehicle_statistics(
-        "us_m3_lee", snapshot_id=statistics_import.snapshot_id
-    )
+    assert repository.get_vehicle_statistics("us_m3_lee", snapshot_id=statistics_import.snapshot_id)
     engine.dispose()
 
 

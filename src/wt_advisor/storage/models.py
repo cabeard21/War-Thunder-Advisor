@@ -84,9 +84,7 @@ class VehicleSourceIdRow(Base):
         UniqueConstraint(
             "snapshot_id", "provider", "source_vehicle_id", name="uq_source_vehicle_snapshot"
         ),
-        ForeignKeyConstraint(
-            ["snapshot_id"], ["data_snapshots.snapshot_id"], ondelete="RESTRICT"
-        ),
+        ForeignKeyConstraint(["snapshot_id"], ["data_snapshots.snapshot_id"], ondelete="RESTRICT"),
     )
 
     snapshot_id: Mapped[str] = mapped_column(String(160), primary_key=True)
@@ -100,9 +98,7 @@ class VehicleSourceIdRow(Base):
 class VehicleMetadataRow(Base):
     __tablename__ = "vehicle_metadata"
     __table_args__ = (
-        ForeignKeyConstraint(
-            ["snapshot_id"], ["data_snapshots.snapshot_id"], ondelete="RESTRICT"
-        ),
+        ForeignKeyConstraint(["snapshot_id"], ["data_snapshots.snapshot_id"], ondelete="RESTRICT"),
     )
 
     snapshot_id: Mapped[str] = mapped_column(String(160), primary_key=True)
@@ -178,6 +174,139 @@ class VehicleStatisticsRow(Base):
     ground_kills: Mapped[int | None] = mapped_column(Integer)
     air_kills: Mapped[int | None] = mapped_column(Integer)
     deaths: Mapped[int | None] = mapped_column(Integer)
+    reported_win_rate: Mapped[float | None] = mapped_column(Float)
+    reported_kd: Mapped[float | None] = mapped_column(Float)
+    reported_kills_per_battle: Mapped[float | None] = mapped_column(Float)
+    ratio_provenance: Mapped[str | None] = mapped_column(String(60))
+
+
+class CapabilityObservationRow(Base):
+    __tablename__ = "capability_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "snapshot_id",
+            "vehicle_id",
+            "capability",
+            "source_reference",
+            name="uq_capability_observation_source",
+        ),
+    )
+
+    observation_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("data_snapshots.snapshot_id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    vehicle_id: Mapped[str] = mapped_column(
+        ForeignKey("vehicles.vehicle_id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    capability: Mapped[str] = mapped_column(String(60), nullable=False)
+    value: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    source_provider: Mapped[str] = mapped_column(String(120), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(60), nullable=False)
+    source_reference: Mapped[str] = mapped_column(Text, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class AvailabilityObservationRow(Base):
+    __tablename__ = "availability_observations"
+
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("data_snapshots.snapshot_id", ondelete="RESTRICT"), primary_key=True
+    )
+    vehicle_id: Mapped[str] = mapped_column(
+        ForeignKey("vehicles.vehicle_id", ondelete="RESTRICT"), primary_key=True
+    )
+    acquisition_type: Mapped[str] = mapped_column(String(60), nullable=False)
+    researchability: Mapped[str] = mapped_column(String(60), nullable=False)
+    tree_membership: Mapped[str] = mapped_column(String(60), nullable=False)
+    visibility: Mapped[str] = mapped_column(String(60), nullable=False)
+    source_provider: Mapped[str] = mapped_column(String(120), nullable=False)
+    source_reference: Mapped[str] = mapped_column(Text, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class VehicleIdentityAliasRow(Base):
+    __tablename__ = "vehicle_identity_aliases"
+    __table_args__ = (
+        UniqueConstraint(
+            "snapshot_id", "provider", "source_vehicle_id", name="uq_identity_alias_source"
+        ),
+    )
+
+    alias_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("data_snapshots.snapshot_id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    provider: Mapped[str] = mapped_column(String(120), nullable=False)
+    source_vehicle_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    canonical_vehicle_id: Mapped[str] = mapped_column(
+        ForeignKey("vehicles.vehicle_id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    deprecated_vehicle_id: Mapped[str | None] = mapped_column(String(160))
+    confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    source_reference: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class ResearchGraphEdgeRow(Base):
+    __tablename__ = "research_graph_edges"
+    __table_args__ = (
+        UniqueConstraint(
+            "snapshot_id",
+            "parent_vehicle_id",
+            "child_vehicle_id",
+            "edge_type",
+            "prerequisite_group",
+            name="uq_research_graph_edge",
+        ),
+    )
+
+    edge_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("data_snapshots.snapshot_id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    nation: Mapped[str] = mapped_column(String(40), nullable=False)
+    domain: Mapped[str] = mapped_column(String(40), nullable=False)
+    parent_vehicle_id: Mapped[str] = mapped_column(
+        ForeignKey("vehicles.vehicle_id", ondelete="RESTRICT"), nullable=False
+    )
+    child_vehicle_id: Mapped[str] = mapped_column(
+        ForeignKey("vehicles.vehicle_id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    edge_type: Mapped[str] = mapped_column(String(60), nullable=False)
+    prerequisite_group: Mapped[str] = mapped_column(String(120), nullable=False)
+    group_semantics: Mapped[str] = mapped_column(String(10), nullable=False)
+
+
+class ImportAttemptRow(Base):
+    __tablename__ = "import_attempts"
+    __table_args__ = (
+        UniqueConstraint(
+            "dataset_type", "provider", "raw_checksum", "status", name="uq_import_attempt"
+        ),
+    )
+
+    attempt_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    dataset_type: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    provider: Mapped[str] = mapped_column(String(120), nullable=False)
+    attempted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False)
+    error: Mapped[str | None] = mapped_column(Text)
+    raw_checksum: Mapped[str] = mapped_column(String(64), nullable=False)
+    media_type: Mapped[str] = mapped_column(String(120), nullable=False)
+    raw_content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+
+
+class StatisticsImportDiagnosticRow(Base):
+    __tablename__ = "statistics_import_diagnostics"
+
+    snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("data_snapshots.snapshot_id", ondelete="RESTRICT"), primary_key=True
+    )
+    recognized_columns: Mapped[Any] = mapped_column(JSON, nullable=False)
+    unknown_columns: Mapped[Any] = mapped_column(JSON, nullable=False)
+    matched_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    unresolved_source_ids: Mapped[Any] = mapped_column(JSON, nullable=False)
+    duplicate_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
 class OverrideRevisionRow(Base):
@@ -230,3 +359,44 @@ class UserVehicleStateRow(Base):
     )
     status: Mapped[str] = mapped_column(String(60), nullable=False)
     revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    superseded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    superseded_by_vehicle_id: Mapped[str | None] = mapped_column(String(160))
+
+
+class ProfileReconciliationAuditRow(Base):
+    __tablename__ = "profile_reconciliation_audits"
+    __table_args__ = (
+        UniqueConstraint(
+            "profile_id", "identity_snapshot_id", "source_revision", name="uq_reconciliation_run"
+        ),
+    )
+
+    audit_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("user_profiles.profile_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    identity_snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("data_snapshots.snapshot_id", ondelete="RESTRICT"), nullable=False
+    )
+    source_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    resulting_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ProfileReconciliationItemRow(Base):
+    __tablename__ = "profile_reconciliation_items"
+
+    item_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    audit_id: Mapped[int] = mapped_column(
+        ForeignKey("profile_reconciliation_audits.audit_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    deprecated_vehicle_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    canonical_vehicle_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    deprecated_status: Mapped[str] = mapped_column(String(60), nullable=False)
+    canonical_status: Mapped[str | None] = mapped_column(String(60))
+    chosen_status: Mapped[str] = mapped_column(String(60), nullable=False)
+    conflict: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)

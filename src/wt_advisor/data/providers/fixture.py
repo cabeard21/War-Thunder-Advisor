@@ -38,6 +38,18 @@ class FixtureProvider:
             raise ValueError("fixture root must be an object")
         return decoded
 
+    @staticmethod
+    def load_m2_scenarios() -> dict[str, Any]:
+        """Load the immutable advisor-quality scenario definitions."""
+
+        fixture = files("wt_advisor.data.fixtures").joinpath(
+            "usa_ground_rb_m2_scenarios.json"
+        )
+        decoded = json.loads(fixture.read_text(encoding="utf-8"))
+        if not isinstance(decoded, dict):
+            raise ValueError("Milestone 2 scenario fixture root must be an object")
+        return decoded
+
     def fetch_vehicles(self) -> RawVehicleDataset:
         raw = self._read()
         rows = tuple(RawVehicleRecord.model_validate(row) for row in raw["vehicles"])

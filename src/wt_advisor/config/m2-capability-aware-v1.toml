@@ -1,0 +1,58 @@
+ruleset_id = "m2-capability-aware-v1"
+
+[weights]
+br_cohesion = 0.25
+backup_depth = 0.20
+role_coverage = 0.20
+anti_air = 0.10
+scouting = 0.05
+uptier_resilience = 0.10
+statistical_strength = 0.10
+role_redundancy = 0.0
+
+[br_cohesion]
+top = 100.0
+one_step = 80.0
+two_steps = 50.0
+farther = 0.0
+
+[backup_depth]
+top = 1.0
+one_step = 0.75
+two_steps = 0.25
+farther = 0.0
+desired_vehicles = 3
+
+[role_coverage]
+frontline = 0.35
+mobility = 0.25
+anti_armor = 0.20
+anti_air = 0.20
+
+[uptier]
+high = 100.0
+medium = 60.0
+low = 25.0
+unknown = 50.0
+
+[statistics]
+win_rate_weight = 0.40
+kd_weight = 0.35
+kills_per_battle_weight = 0.25
+win_rate_k = 1000.0
+kills_per_battle_k = 1000.0
+kd_k = 250.0
+minimum_peers = 5
+neutral_score = 50.0
+
+[readiness]
+minimum_within_one_step = 2
+minimum_within_two_steps = 3
+minimum_backup_depth = 60.0
+minimum_non_spaa_combat = 2
+severe_count_more_than_two_steps = 2
+severe_any_more_than_steps = 3
+
+[statuses]
+good_at_least = 75.0
+critical_below = 40.0

@@ -9,7 +9,11 @@ providers / fixtures -> immutable snapshots -> domain services -> CLI and MCP
 
 ## Evidence and storage
 
-SQLite is managed by Alembic from revision `0002`. Imported payloads create immutable dataset snapshots and raw artifacts. Canonical vehicle IDs, provider aliases, versioned metadata, mode-specific BR observations, capabilities, research edges, statistics, and overrides retain their snapshot references. User profiles and vehicle statuses are stored separately and revisioned on mutation.
+SQLite is managed by Alembic through revision `0004`. Imported payloads create immutable dataset
+snapshots and raw artifacts. Metadata, capabilities, resolved availability, identity aliases,
+research graphs, and statistics are independently versioned components. User profiles and vehicle
+statuses are stored separately and revisioned on mutation; alias reconciliation has dry-run,
+optimistic-revision, supersession, and audit records.
 
 Re-importing identical content is idempotent. The repository verifies the retained raw artifact's
 size and checksum at its persistence boundary. Overrides resolve on top of imported facts and
@@ -28,25 +32,45 @@ neutral composite contribution.
 Every snapshot has an explicit `purpose` (`operational` or `acceptance`) and optional
 `compatibility_key`. The frozen acceptance vehicle and synthetic statistics snapshots share an
 acceptance-only key, so they bind to each other and cannot become evidence for live operational
-data. Research edges are loaded only from the active vehicle snapshot; progression reports
-`progression_unavailable` when that snapshot has no graph.
+data. Research graphs have explicit all/any prerequisite groups and compatibility metadata.
+Progression reports `progression_unavailable` when no compatible graph exists and never borrows an
+unrelated tree. `get_data_status` reports availability, freshness, coverage, gaps, and the selected
+snapshot for every component.
 
 ## Providers
 
 - `FixtureProvider` supplies network-free acceptance evidence.
-- `WarThunderVehiclesApiProvider` is a bounded, cached, retrying HTTP adapter independent of domain logic.
-- JSON and strict-column CSV statistics importers normalize exported observations.
+- `WarThunderVehiclesApiProvider` is a bounded, cached, retrying HTTP adapter. Detail records map
+  only explicit scouting, artillery, smoke, vertical-stabilizer, and predecessor facts; omission is
+  not false.
+- Strict bounded JSON/YAML importers handle capability, availability, and research-graph evidence.
+- JSON and CSV statistics inspection validates identity match rate, duplicates, scope, sample
+  period, and metric coverage before import.
 - YAML overrides require a revision, vehicle ID, field, typed value, reason, reference, and date.
 
 See [data-sources.md](data-sources.md) for licensing, freshness, and StatShark findings.
 
 ## Analysis and generation
 
-Rules are pure functions configured by `config/defaults.toml`. Each returns a visible score/status, effective composite contribution, evidence, warnings, and explanation. The ruleset hash and every data snapshot are included in the evidence context.
+Rules are pure functions with frozen `m1-baseline-v1` and explicit
+`m2-capability-aware-v1` configurations. M2 capability rules use present, verified-absent, unknown,
+and conflicted states. Specialist/SPAA redundancy is diagnostic and zero-weight; it cannot affect
+score, readiness, or ordering. The ruleset hash and every selected snapshot are included in the
+evidence context.
 
 Candidate generation enumerates unordered combinations under a 500,000-combination guard, groups them by resulting BR, removes dominated score vectors, and returns deterministic per-BR frontiers. Cross-BR recommendation selects the highest frontier passing readiness gates; it never compares raw lineup scores across BRs.
 
-One-step progression returns the best expanded-pool lineup and a lineup forced to include the unlock. Hypothetical ownership is request-local and does not mutate profile state.
+`lower_br_alternative` is an optional, readiness-passing frontier rather than a fallback for
+the least-deficient candidate. When a request supplies `target_br`, it can only refer to a
+frontier strictly below that target, and therefore is `null` when the request's scoped search
+contains only the target BR. Without `target_br`, it must be strictly below the recommended BR,
+or below the highest evaluated BR when no frontier passes readiness. The service never expands a
+targeted search merely to manufacture this alternative; failed frontiers remain available in
+`groups` with their diagnostics.
+
+One-step progression returns the best expanded-pool and forced-include lineups plus adoption,
+frontier, role, readiness, research-cost, and cross-BR facts. Hypothetical ownership is request-local
+and does not mutate profile state.
 
 ## Interfaces
 

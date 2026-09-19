@@ -4,16 +4,49 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Protocol, cast
 
 import typer
 from pydantic import BaseModel
 
-from wt_advisor.domain.models import GameMode, Nation, VehicleStatus
-from wt_advisor.services.acceptance import build_acceptance_report, render_acceptance_markdown
+from wt_advisor.domain.models import GameMode, Nation, SnapshotPurpose, VehicleStatus
+from wt_advisor.services.acceptance import (
+    build_acceptance_report,
+    build_m2_acceptance_report,
+    render_acceptance_markdown,
+    render_m2_acceptance_markdown,
+)
 from wt_advisor.services.advisor import AdvisorService
+
+
+class _MilestoneTwoService(Protocol):
+    """Additional application boundary used by Milestone 2 CLI commands."""
+
+    def reconcile_profile(
+        self,
+        profile_id: str,
+        *,
+        apply: bool = False,
+        expected_revision: str | None = None,
+    ) -> object: ...
+
+    def inspect_statistics(
+        self,
+        path: Path,
+        *,
+        provider: str,
+        purpose: SnapshotPurpose,
+    ) -> object: ...
+
+    def import_statistics(
+        self,
+        path: Path,
+        *,
+        provider: str,
+        purpose: SnapshotPurpose,
+    ) -> object: ...
 
 
 def _default_service() -> AdvisorService:
@@ -24,7 +57,7 @@ def _default_service() -> AdvisorService:
 def _jsonable(value: Any) -> Any:
     if isinstance(value, BaseModel):
         return value.model_dump(mode="json")
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {str(key): _jsonable(item) for key, item in value.items()}
     if isinstance(value, (tuple, list, set, frozenset)):
         return [_jsonable(item) for item in value]
@@ -51,12 +84,14 @@ def create_app(service: AdvisorService | None = None) -> typer.Typer:
     profile = typer.Typer(help="Inspect or update user progression.")
     lineup = typer.Typer(help="Analyze and compare lineups.")
     progress = typer.Typer(help="Evaluate one-step progression.")
+    statistics = typer.Typer(help="Inspect and import validated statistics evidence.")
     root.add_typer(data, name="data")
     root.add_typer(vehicles, name="vehicles")
     root.add_typer(vehicle, name="vehicle")
     root.add_typer(profile, name="profile")
     root.add_typer(lineup, name="lineup")
     root.add_typer(progress, name="progress")
+    root.add_typer(statistics, name="statistics")
 
     resolved_service: AdvisorService | None = service
 
@@ -143,6 +178,80 @@ def create_app(service: AdvisorService | None = None) -> typer.Typer:
             as_json=json_output,
         )
 
+    @profile.command("reconcile")
+    def profile_reconcile(
+        profile_id: Annotated[str, typer.Option("--profile")] = "acceptance",
+        dry_run: Annotated[
+            bool,
+            typer.Option("--dry-run", help="Preview the immutable reconciliation plan."),
+        ] = False,
+        apply: Annotated[
+            bool,
+            typer.Option("--apply", help="Apply confirmed aliases transactionally."),
+        ] = False,
+        expected_revision: Annotated[
+            str | None,
+            typer.Option(
+                "--expected-revision",
+                help="Reject apply when the profile revision no longer matches.",
+            ),
+        ] = None,
+        json_output: Annotated[bool, typer.Option("--json", help="Emit compact JSON.")] = False,
+    ) -> None:
+        if dry_run and apply:
+            raise typer.BadParameter("--dry-run and --apply are mutually exclusive")
+        if expected_revision is not None and not apply:
+            raise typer.BadParameter(
+                "--expected-revision requires --apply",
+                param_hint="--expected-revision",
+            )
+        _emit(
+            cast(_MilestoneTwoService, advisor()).reconcile_profile(
+                profile_id,
+                apply=apply,
+                expected_revision=expected_revision,
+            ),
+            as_json=json_output,
+        )
+
+    @statistics.command("inspect")
+    def statistics_inspect(
+        source: Annotated[
+            Path,
+            typer.Argument(exists=True, dir_okay=False, readable=True),
+        ],
+        provider: Annotated[str, typer.Option("--provider", help="Source provider name.")],
+        purpose: Annotated[SnapshotPurpose, typer.Option("--purpose")] = (
+            SnapshotPurpose.OPERATIONAL
+        ),
+        json_output: Annotated[bool, typer.Option("--json", help="Emit compact JSON.")] = False,
+    ) -> None:
+        _emit(
+            cast(_MilestoneTwoService, advisor()).inspect_statistics(
+                source, provider=provider, purpose=purpose
+            ),
+            as_json=json_output,
+        )
+
+    @statistics.command("import")
+    def statistics_import(
+        source: Annotated[
+            Path,
+            typer.Argument(exists=True, dir_okay=False, readable=True),
+        ],
+        provider: Annotated[str, typer.Option("--provider", help="Source provider name.")],
+        purpose: Annotated[SnapshotPurpose, typer.Option("--purpose")] = (
+            SnapshotPurpose.OPERATIONAL
+        ),
+        json_output: Annotated[bool, typer.Option("--json", help="Emit compact JSON.")] = False,
+    ) -> None:
+        _emit(
+            cast(_MilestoneTwoService, advisor()).import_statistics(
+                source, provider=provider, purpose=purpose
+            ),
+            as_json=json_output,
+        )
+
     @lineup.command("analyze")
     def lineup_analyze(
         vehicle_ids: Annotated[list[str], typer.Argument()],
@@ -208,13 +317,24 @@ def create_app(service: AdvisorService | None = None) -> typer.Typer:
 
     @root.command("acceptance")
     def acceptance_report(
+        milestone: Annotated[
+            int, typer.Option("--milestone", min=1, max=2, help="Acceptance milestone.")
+        ] = 1,
         json_output: Annotated[bool, typer.Option("--json", help="Emit compact JSON.")] = False,
     ) -> None:
-        report = build_acceptance_report(advisor())
+        report = (
+            build_acceptance_report(advisor())
+            if milestone == 1
+            else build_m2_acceptance_report()
+        )
         if json_output:
             _emit(report, as_json=True)
         else:
-            typer.echo(render_acceptance_markdown(report))
+            typer.echo(
+                render_acceptance_markdown(report)
+                if milestone == 1
+                else render_m2_acceptance_markdown(report)
+            )
 
     return root
 
