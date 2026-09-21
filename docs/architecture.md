@@ -9,7 +9,7 @@ providers / fixtures -> immutable snapshots -> domain services -> CLI and MCP
 
 ## Evidence and storage
 
-SQLite is managed by Alembic through revision `0004`. Imported payloads create immutable dataset
+SQLite is managed by Alembic through revision `0005`. Imported payloads create immutable dataset
 snapshots and raw artifacts. Metadata, capabilities, resolved availability, identity aliases,
 research graphs, and statistics are independently versioned components. User profiles and vehicle
 statuses are stored separately and revisioned on mutation; alias reconciliation has dry-run,
@@ -92,4 +92,9 @@ All tools except the idempotent profile mutation are annotated read-only. Struct
 
 ## Local security boundary
 
-The MCP server uses stdio and the application has no public HTTP listener or authentication surface. Inputs are schema-validated, SQL is parameterized through SQLAlchemy, import sizes and HTTP timeouts are bounded, and secrets are neither required nor stored. Live imports are explicit operations; normal tests and acceptance runs are network-free.
+The MCP server uses stdio. The optional dashboard serves its API and bundled UI on
+the configured local address (`127.0.0.1` by default) without authentication; it is
+not intended for public exposure. Inputs are schema-validated, SQL is parameterized
+through SQLAlchemy, import sizes and HTTP timeouts are bounded, and secrets are neither
+required nor stored. Live imports are explicit operations; normal tests and acceptance
+runs are network-free.

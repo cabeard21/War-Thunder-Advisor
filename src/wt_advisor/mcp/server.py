@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from dataclasses import fields, is_dataclass
+from datetime import date, datetime
+from enum import Enum
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -29,8 +32,7 @@ MUTATION = ToolAnnotations(
 
 
 BR_TENTHS_DESCRIPTION = (
-    "Battle rating in integer tenths: 10 = 1.0, 23 = 2.3, "
-    "27 = 2.7, and 40 = 4.0."
+    "Battle rating in integer tenths: 10 = 1.0, 23 = 2.3, 27 = 2.7, and 40 = 4.0."
 )
 BR_EXAMPLES = [10, 23, 27, 40]
 
@@ -40,6 +42,12 @@ def _jsonable(value: Any) -> Any:
 
     if isinstance(value, BaseModel):
         return value.model_dump(mode="json")
+    if is_dataclass(value) and not isinstance(value, type):
+        return {field.name: _jsonable(getattr(value, field.name)) for field in fields(value)}
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
     if isinstance(value, Mapping):
         return {str(key): _jsonable(item) for key, item in value.items()}
     if isinstance(value, (tuple, list, set, frozenset)):
@@ -106,10 +114,17 @@ def create_server(service: AdvisorService) -> MCPServer[Any]:
         vehicle_id: str,
         status: VehicleStatus,
         profile_id: str = "acceptance",
+        expected_revision: str | None = None,
+        expected_write_revision: str | None = None,
     ) -> dict[str, Any]:
         """Idempotently update one user vehicle status and return before/after state."""
 
-        return _dump(service.set_user_vehicle_status(profile_id, vehicle_id, status))
+        return _dump(
+            service.set_user_vehicle_status(
+                profile_id, vehicle_id, status, expected_revision=expected_revision,
+                expected_write_revision=expected_write_revision,
+            )
+        )
 
     @server.tool(annotations=READ_ONLY, structured_output=True)
     def analyze_lineup(vehicle_ids: list[str]) -> dict[str, Any]:
@@ -133,6 +148,8 @@ def create_server(service: AdvisorService) -> MCPServer[Any]:
         top_n: int = 10,
         hypothetical_owned: list[str] | None = None,
         required_vehicle_id: str | None = None,
+        required_vehicle_ids: list[str] | None = None,
+        excluded_vehicle_ids: list[str] | None = None,
         allow_partial: bool = False,
     ) -> dict[str, Any]:
         """Generate deterministic Pareto-frontier lineups grouped by BR."""
@@ -144,9 +161,150 @@ def create_server(service: AdvisorService) -> MCPServer[Any]:
                 top_n=top_n,
                 hypothetical_owned=frozenset(hypothetical_owned or ()),
                 required_vehicle_id=required_vehicle_id,
+                required_vehicle_ids=(
+                    None if required_vehicle_ids is None else frozenset(required_vehicle_ids)
+                ),
+                excluded_vehicle_ids=frozenset(excluded_vehicle_ids or ()),
                 allow_partial=allow_partial,
             )
         )
+
+    @server.tool(annotations=READ_ONLY, structured_output=True)
+    def list_presets(profile_id: str = "acceptance") -> list[dict[str, Any]]:
+        """List durable lineup presets for the profile."""
+
+        return [_dump(item) for item in service.list_presets(profile_id)]
+
+    @server.tool(annotations=MUTATION, structured_output=True)
+    def create_preset(
+        name: str,
+        slots: list[str],
+        profile_id: str = "acceptance",
+        required_vehicle_ids: list[str] | None = None,
+        excluded_vehicle_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Create a durable, revisioned lineup preset."""
+
+        return _dump(
+            service.create_preset(
+                profile_id,
+                name=name,
+                slots=tuple(slots),
+                required_vehicle_ids=tuple(required_vehicle_ids or ()),
+                excluded_vehicle_ids=tuple(excluded_vehicle_ids or ()),
+            )
+        )
+
+    @server.tool(annotations=MUTATION, structured_output=True)
+    def update_preset(
+        preset_id: str,
+        name: str,
+        slots: list[str],
+        expected_revision: str,
+        profile_id: str = "acceptance",
+        required_vehicle_ids: list[str] | None = None,
+        excluded_vehicle_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Update a preset when its persisted revision still matches."""
+
+        return _dump(
+            service.update_preset(
+                profile_id,
+                preset_id,
+                name=name,
+                slots=tuple(slots),
+                required_vehicle_ids=tuple(required_vehicle_ids or ()),
+                excluded_vehicle_ids=tuple(excluded_vehicle_ids or ()),
+                expected_revision=expected_revision,
+            )
+        )
+
+    @server.tool(annotations=MUTATION, structured_output=True)
+    def delete_preset(
+        preset_id: str,
+        expected_revision: str,
+        profile_id: str = "acceptance",
+    ) -> dict[str, Any]:
+        """Delete a preset when its persisted revision still matches."""
+
+        service.delete_preset(
+            profile_id, preset_id, expected_revision=expected_revision
+        )
+        return {"deleted": True}
+
+    @server.tool(annotations=READ_ONLY, structured_output=True)
+    def get_advisor_context(profile_id: str = "acceptance") -> dict[str, Any]:
+        """Read the saved advisor context without changing it."""
+
+        return _dump(service.get_advisor_context(profile_id))
+
+    @server.tool(annotations=MUTATION, structured_output=True)
+    def update_advisor_context(
+        expected_revision: str,
+        profile_id: str = "acceptance",
+        selected_preset_id: str | None = None,
+        target_br: Annotated[
+            int | None,
+            Field(description=BR_TENTHS_DESCRIPTION, examples=BR_EXAMPLES),
+        ] = None,
+        required_vehicle_ids: list[str] | None = None,
+        excluded_vehicle_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Update the selected preset and saved constrained-generation context."""
+
+        return _dump(
+            service.update_advisor_context(
+                profile_id,
+                selected_preset_id=selected_preset_id,
+                target_br=target_br,
+                required_vehicle_ids=tuple(required_vehicle_ids or ()),
+                excluded_vehicle_ids=tuple(excluded_vehicle_ids or ()),
+                expected_revision=expected_revision,
+            )
+        )
+
+    @server.tool(annotations=MUTATION, structured_output=True)
+    def evaluate_and_store(
+        profile_id: str = "acceptance",
+        target_br: Annotated[
+            int | None,
+            Field(description=BR_TENTHS_DESCRIPTION, examples=BR_EXAMPLES),
+        ] = None,
+        top_n: int = 10,
+        hypothetical_owned: list[str] | None = None,
+        required_vehicle_ids: list[str] | None = None,
+        excluded_vehicle_ids: list[str] | None = None,
+        allow_partial: bool = False,
+    ) -> dict[str, Any]:
+        """Calculate from captured inputs and persist the immutable result."""
+
+        return service.evaluate_and_store(
+            profile_id=profile_id,
+            target_br=target_br,
+            top_n=top_n,
+            hypothetical_owned=frozenset(hypothetical_owned or ()),
+            required_vehicle_ids=(
+                None
+                if required_vehicle_ids is None
+                else frozenset(required_vehicle_ids)
+            ),
+            excluded_vehicle_ids=frozenset(excluded_vehicle_ids or ()),
+            allow_partial=allow_partial,
+        )
+
+    @server.tool(annotations=READ_ONLY, structured_output=True)
+    def get_stored_evaluation(evaluation_id: str, profile_id: str = "acceptance") -> dict[str, Any]:
+        """Read an immutable stored evaluation; this never recalculates it."""
+
+        return service.get_stored_evaluation(profile_id, evaluation_id)
+
+    @server.tool(annotations=MUTATION, structured_output=True)
+    def reevaluate_stored_evaluation(
+        evaluation_id: str, profile_id: str = "acceptance"
+    ) -> dict[str, Any]:
+        """Explicitly recalculate a stored evaluation from its saved inputs."""
+
+        return service.reevaluate_stored_evaluation(profile_id, evaluation_id)
 
     @server.tool(annotations=READ_ONLY, structured_output=True)
     def suggest_lineup_additions(

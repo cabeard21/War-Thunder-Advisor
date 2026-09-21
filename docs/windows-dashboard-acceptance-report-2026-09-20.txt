@@ -1,0 +1,19 @@
+War Thunder Advisor — Windows Dashboard Acceptance
+Date: 9/20/2026, 9:24:31 PM
+Overall: PASS
+
+Installed wheel launch           PASS
+Garage matches CLI               PASS
+Mutation and draft retention     PASS
+Pins / exclusion / readiness     PASS
+Unsatisfiable diagnostics        PASS
+Same-BR comparison               PASS
+Cross-BR null delta              PASS
+Preset / context restart         PASS
+Hypothetical isolation           PASS
+Research / data-gap display      PASS
+Conflict / retry recovery        PASS
+Stored-result staleness          PASS
+
+Notes:
+Completed by headed Playwright against the clean installed-wheel process outside the checkout. Full dashboard workflow and actual process restart passed 1/1. Corroboration: package imported from external venv; schema 0005; ruleset 20e5db94e06f7729701d6219b12fe21548c59e62fed96306da93006423ae9104; hypothetical revision and garage unchanged; research payload present; unavailable capability evidence remained explicit; unsatisfiable constraints returned HTTP 422 with structured code; stored evaluation became stale only after garage mutation while its payload remained unchanged.

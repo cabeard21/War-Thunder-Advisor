@@ -642,3 +642,23 @@ def test_provider_datasets_can_be_imported_without_provider_storage_coupling(
 def database(tmp_path: Path) -> tuple[Engine, EvidenceRepository]:
     engine = create_database(tmp_path / "advisor.sqlite")
     return engine, EvidenceRepository(engine)
+
+
+def test_populated_0004_upgrades_to_0005_without_losing_profile(tmp_path: Path) -> None:
+    database_path = tmp_path / "legacy.sqlite"
+    engine = build_engine(database_path)
+    command.upgrade(_alembic_config(engine), "0004")
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO user_profiles "
+            "(profile_id, nation, preferred_mode, crew_slots, include_premiums, "
+            "include_event_vehicles, include_pack_vehicles, revision) "
+            "VALUES ('legacy', 'usa', 'ground_realistic', 5, 0, 0, 0, 0)"
+        )
+
+    command.upgrade(_alembic_config(engine), "head")
+
+    repository = EvidenceRepository(engine)
+    assert repository.get_profile("legacy") is not None
+    assert inspect(engine).has_table("stored_evaluations")
+    engine.dispose()

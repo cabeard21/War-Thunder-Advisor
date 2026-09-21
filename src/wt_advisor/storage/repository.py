@@ -9,7 +9,7 @@ from datetime import UTC, date, datetime
 from hashlib import sha256
 from typing import Any, Protocol
 
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, select, update
 from sqlalchemy.orm import Session
 
 from wt_advisor.domain.models import (
@@ -46,10 +46,12 @@ from wt_advisor.domain.models import (
 )
 from wt_advisor.storage.db import database_session
 from wt_advisor.storage.models import (
+    AdvisorContextRow,
     AvailabilityObservationRow,
     CapabilityObservationRow,
     DataSnapshotRow,
     ImportAttemptRow,
+    LineupPresetRow,
     OverrideEntryRow,
     OverrideRevisionRow,
     ProfileReconciliationAuditRow,
@@ -58,6 +60,7 @@ from wt_advisor.storage.models import (
     ResearchEdgeRow,
     ResearchGraphEdgeRow,
     StatisticsImportDiagnosticRow,
+    StoredEvaluationRow,
     UserProfileRow,
     UserVehicleStateRow,
     VehicleBattleRatingRow,
@@ -146,6 +149,7 @@ class StoredProfile:
     include_event_vehicles: bool
     include_pack_vehicles: bool
     revision: int
+    write_revision: int
 
     def to_domain(self) -> UserProfile:
         return UserProfile(
@@ -165,6 +169,53 @@ class VehicleStatusChange:
     after: VehicleStatus
     profile_revision: int
     changed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class StoredPreset:
+    preset_id: str
+    profile_id: str
+    name: str
+    slots: tuple[str, ...]
+    required_vehicle_ids: tuple[str, ...]
+    excluded_vehicle_ids: tuple[str, ...]
+    revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class StoredAdvisorContext:
+    profile_id: str
+    selected_preset_id: str | None
+    target_br: int | None
+    required_vehicle_ids: tuple[str, ...]
+    excluded_vehicle_ids: tuple[str, ...]
+    revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class StoredEvaluation:
+    evaluation_id: str
+    profile_id: str
+    kind: str
+    profile_revision: str
+    profile_state: dict[str, Any]
+    effective_inputs: dict[str, Any]
+    evidence_context: dict[str, Any]
+    ruleset_hash: str
+    schema_revision: str
+    result_id: str
+    result_payload: dict[str, Any]
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationSnapshot:
+    """All mutable profile inputs captured by one read transaction."""
+
+    profile: StoredProfile
+    vehicle_statuses: dict[str, VehicleStatus]
+    context: StoredAdvisorContext
+    preset: StoredPreset | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -683,9 +734,7 @@ class EvidenceRepository:
             )
             return None if row is None else row.canonical_vehicle_id
 
-    def list_confirmed_identity_aliases(
-        self, *, snapshot_id: str, provider: str
-    ) -> dict[str, str]:
+    def list_confirmed_identity_aliases(self, *, snapshot_id: str, provider: str) -> dict[str, str]:
         """Return active, provider-scoped aliases for import-time identity resolution."""
 
         with self.session() as session:
@@ -1369,6 +1418,7 @@ class EvidenceRepository:
                     include_event_vehicles=profile.include_event_vehicles,
                     include_pack_vehicles=profile.include_pack_vehicles,
                     revision=0,
+                    write_revision=0,
                 )
             )
             return CreationResult(created=True)
@@ -1389,6 +1439,7 @@ class EvidenceRepository:
             include_event_vehicles=row.include_event_vehicles,
             include_pack_vehicles=row.include_pack_vehicles,
             revision=row.revision,
+            write_revision=row.write_revision,
         )
 
     def set_vehicle_status(
@@ -1396,14 +1447,35 @@ class EvidenceRepository:
         profile_id: str,
         vehicle_id: str,
         status: VehicleStatus | str,
+        expected_revision: int | str | None = None,
+        expected_write_revision: int | str | None = None,
     ) -> VehicleStatusChange:
+        if expected_revision is not None and expected_write_revision is not None:
+            raise ValueError("expected_revision and expected_write_revision are mutually exclusive")
         normalized_status = status if isinstance(status, VehicleStatus) else VehicleStatus(status)
         with self.session() as session:
             profile = session.get(UserProfileRow, profile_id)
             if profile is None:
                 raise LookupError(f"unknown profile {profile_id!r}")
+            if expected_write_revision is not None and profile.write_revision != int(
+                str(expected_write_revision).removeprefix("write-rev-")
+            ):
+                raise ValueError("profile write revision changed")
             if session.get(VehicleRow, vehicle_id) is None:
                 raise LookupError(f"unknown vehicle {vehicle_id!r}")
+            current_statuses = {
+                row.vehicle_id: VehicleStatus(row.status)
+                for row in session.scalars(
+                    select(UserVehicleStateRow).where(
+                        UserVehicleStateRow.profile_id == profile_id,
+                        UserVehicleStateRow.superseded.is_(False),
+                    )
+                )
+            }
+            if expected_revision is not None and stable_hash(
+                dict(sorted(current_statuses.items()))
+            ) != str(expected_revision):
+                raise ValueError("profile revision changed")
             state = session.get(UserVehicleStateRow, (profile_id, vehicle_id))
             before = None if state is None else VehicleStatus(state.status)
             if before is normalized_status:
@@ -1413,7 +1485,25 @@ class EvidenceRepository:
                     profile_revision=profile.revision,
                     changed=False,
                 )
-            profile.revision += 1
+            current_revision = profile.revision
+            guarded_update = (
+                update(UserProfileRow)
+                .where(
+                    UserProfileRow.profile_id == profile_id,
+                    UserProfileRow.revision == current_revision,
+                )
+                .values(
+                    revision=current_revision + 1,
+                    write_revision=profile.write_revision + 1,
+                )
+            )
+            update_result = session.execute(
+                guarded_update.execution_options(synchronize_session=False)
+            )
+            if getattr(update_result, "rowcount", 0) != 1:
+                raise ValueError("profile revision changed")
+            profile.revision = current_revision + 1
+            profile.write_revision += 1
             if state is None:
                 session.add(
                     UserVehicleStateRow(
@@ -1449,6 +1539,290 @@ class EvidenceRepository:
                 .order_by(UserVehicleStateRow.vehicle_id)
             )
             return {row.vehicle_id: VehicleStatus(row.status) for row in rows}
+
+    @staticmethod
+    def _stored_evaluation(row: StoredEvaluationRow) -> StoredEvaluation:
+        return StoredEvaluation(
+            evaluation_id=row.evaluation_id,
+            profile_id=row.profile_id,
+            kind=row.kind,
+            profile_revision=row.profile_revision,
+            profile_state=dict(row.profile_state),
+            effective_inputs=dict(row.effective_inputs),
+            evidence_context=dict(row.evidence_context),
+            ruleset_hash=row.ruleset_hash,
+            schema_revision=row.schema_revision,
+            result_id=row.result_id,
+            result_payload=dict(row.result_payload),
+            created_at=row.created_at,
+        )
+
+    def store_evaluation(
+        self,
+        *,
+        evaluation_id: str,
+        profile_id: str,
+        kind: str,
+        profile_revision: str,
+        profile_state: dict[str, Any],
+        effective_inputs: dict[str, Any],
+        evidence_context: dict[str, Any],
+        ruleset_hash: str,
+        schema_revision: str,
+        result_id: str,
+        result_payload: dict[str, Any],
+    ) -> StoredEvaluation:
+        with self.session() as session:
+            if session.get(UserProfileRow, profile_id) is None:
+                raise LookupError(f"unknown profile {profile_id!r}")
+            row = StoredEvaluationRow(
+                evaluation_id=evaluation_id,
+                profile_id=profile_id,
+                kind=kind,
+                profile_revision=profile_revision,
+                profile_state=profile_state,
+                effective_inputs=effective_inputs,
+                evidence_context=evidence_context,
+                ruleset_hash=ruleset_hash,
+                schema_revision=schema_revision,
+                result_id=result_id,
+                result_payload=result_payload,
+                created_at=datetime.now(UTC),
+            )
+            session.add(row)
+            session.flush()
+            return self._stored_evaluation(row)
+
+    def get_stored_evaluation(self, profile_id: str, evaluation_id: str) -> StoredEvaluation | None:
+        with self.session() as session:
+            row = session.get(StoredEvaluationRow, evaluation_id)
+            if row is None or row.profile_id != profile_id:
+                return None
+            return self._stored_evaluation(row)
+
+    def capture_evaluation_snapshot(
+        self, profile_id: str, *, preset_id: str | None = None
+    ) -> EvaluationSnapshot:
+        """Materialize mutable calculation inputs without crossing transactions."""
+
+        with self.session() as session:
+            profile_row = session.get(UserProfileRow, profile_id)
+            if profile_row is None:
+                raise LookupError(f"unknown profile {profile_id!r}")
+            statuses = {
+                row.vehicle_id: VehicleStatus(row.status)
+                for row in session.scalars(
+                    select(UserVehicleStateRow)
+                    .where(
+                        UserVehicleStateRow.profile_id == profile_id,
+                        UserVehicleStateRow.superseded.is_(False),
+                    )
+                    .order_by(UserVehicleStateRow.vehicle_id)
+                )
+            }
+            context_row = session.get(AdvisorContextRow, profile_id)
+            context = (
+                StoredAdvisorContext(profile_id, None, None, (), (), 0)
+                if context_row is None
+                else StoredAdvisorContext(
+                    profile_id,
+                    context_row.selected_preset_id,
+                    context_row.target_br,
+                    tuple(context_row.required_vehicle_ids),
+                    tuple(context_row.excluded_vehicle_ids),
+                    context_row.revision,
+                )
+            )
+            selected_preset_id = preset_id or context.selected_preset_id
+            preset_row = (
+                None
+                if selected_preset_id is None
+                else session.get(LineupPresetRow, selected_preset_id)
+            )
+            if preset_row is not None and preset_row.profile_id != profile_id:
+                preset_row = None
+            if preset_id is not None and preset_row is None:
+                raise LookupError("unknown preset")
+            return EvaluationSnapshot(
+                profile=self._stored_profile(profile_row),
+                vehicle_statuses=statuses,
+                context=context,
+                preset=None if preset_row is None else self._preset(preset_row),
+            )
+
+    @staticmethod
+    def _preset(row: LineupPresetRow) -> StoredPreset:
+        return StoredPreset(
+            row.preset_id,
+            row.profile_id,
+            row.name,
+            tuple(row.slots),
+            tuple(row.required_vehicle_ids),
+            tuple(row.excluded_vehicle_ids),
+            row.revision,
+        )
+
+    def create_preset(
+        self,
+        profile_id: str,
+        *,
+        preset_id: str,
+        name: str,
+        slots: tuple[str, ...],
+        required_vehicle_ids: tuple[str, ...],
+        excluded_vehicle_ids: tuple[str, ...],
+    ) -> StoredPreset:
+        normalized = " ".join(name.split()).casefold()
+        if not normalized:
+            raise ValueError("preset name must not be empty")
+        with self.session() as session:
+            if session.get(UserProfileRow, profile_id) is None:
+                raise LookupError(f"unknown profile {profile_id!r}")
+            now = datetime.now(UTC)
+            row = LineupPresetRow(
+                preset_id=preset_id,
+                profile_id=profile_id,
+                name=" ".join(name.split()),
+                normalized_name=normalized,
+                slots=list(slots),
+                required_vehicle_ids=list(required_vehicle_ids),
+                excluded_vehicle_ids=list(excluded_vehicle_ids),
+                revision=1,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(row)
+            session.flush()
+            return self._preset(row)
+
+    def list_presets(self, profile_id: str) -> tuple[StoredPreset, ...]:
+        with self.session() as session:
+            return tuple(
+                self._preset(row)
+                for row in session.scalars(
+                    select(LineupPresetRow)
+                    .where(LineupPresetRow.profile_id == profile_id)
+                    .order_by(LineupPresetRow.name)
+                )
+            )
+
+    def update_preset(
+        self,
+        profile_id: str,
+        preset_id: str,
+        *,
+        name: str,
+        slots: tuple[str, ...],
+        required_vehicle_ids: tuple[str, ...],
+        excluded_vehicle_ids: tuple[str, ...],
+        expected_revision: int | str,
+    ) -> StoredPreset:
+        with self.session() as session:
+            row = session.get(LineupPresetRow, preset_id)
+            if row is None or row.profile_id != profile_id:
+                raise LookupError("unknown preset")
+            if row.revision != int(str(expected_revision).removeprefix("rev-")):
+                raise ValueError("preset revision changed")
+            normalized = " ".join(name.split()).casefold()
+            if not normalized:
+                raise ValueError("preset name must not be empty")
+            row.name, row.normalized_name, row.slots = (
+                " ".join(name.split()),
+                normalized,
+                list(slots),
+            )
+            row.required_vehicle_ids, row.excluded_vehicle_ids, row.revision, row.updated_at = (
+                list(required_vehicle_ids),
+                list(excluded_vehicle_ids),
+                row.revision + 1,
+                datetime.now(UTC),
+            )
+            return self._preset(row)
+
+    def delete_preset(
+        self, profile_id: str, preset_id: str, *, expected_revision: int | str
+    ) -> None:
+        with self.session() as session:
+            row = session.get(LineupPresetRow, preset_id)
+            if row is None or row.profile_id != profile_id:
+                raise LookupError("unknown preset")
+            if row.revision != int(str(expected_revision).removeprefix("rev-")):
+                raise ValueError("preset revision changed")
+            context = session.get(AdvisorContextRow, profile_id)
+            if context is not None and context.selected_preset_id == preset_id:
+                context.selected_preset_id = None
+                context.revision += 1
+            session.delete(row)
+
+    def get_advisor_context(self, profile_id: str) -> StoredAdvisorContext:
+        with self.session() as session:
+            if session.get(UserProfileRow, profile_id) is None:
+                raise LookupError(f"unknown profile {profile_id!r}")
+            row = session.get(AdvisorContextRow, profile_id)
+            if row is None:
+                return StoredAdvisorContext(profile_id, None, None, (), (), 0)
+            return StoredAdvisorContext(
+                profile_id,
+                row.selected_preset_id,
+                row.target_br,
+                tuple(row.required_vehicle_ids),
+                tuple(row.excluded_vehicle_ids),
+                row.revision,
+            )
+
+    def update_advisor_context(
+        self,
+        profile_id: str,
+        *,
+        selected_preset_id: str | None,
+        target_br: int | None,
+        required_vehicle_ids: tuple[str, ...],
+        excluded_vehicle_ids: tuple[str, ...],
+        expected_revision: int | str,
+    ) -> StoredAdvisorContext:
+        with self.session() as session:
+            if session.get(UserProfileRow, profile_id) is None:
+                raise LookupError(f"unknown profile {profile_id!r}")
+            if selected_preset_id is not None:
+                preset = session.get(LineupPresetRow, selected_preset_id)
+                if preset is None or preset.profile_id != profile_id:
+                    raise LookupError("unknown preset")
+            row = session.get(AdvisorContextRow, profile_id)
+            current = 0 if row is None else row.revision
+            if current != int(str(expected_revision).removeprefix("rev-")):
+                raise ValueError("advisor context revision changed")
+            if row is None:
+                row = AdvisorContextRow(
+                    profile_id=profile_id,
+                    selected_preset_id=selected_preset_id,
+                    target_br=target_br,
+                    required_vehicle_ids=list(required_vehicle_ids),
+                    excluded_vehicle_ids=list(excluded_vehicle_ids),
+                    revision=1,
+                )
+                session.add(row)
+            else:
+                (
+                    row.selected_preset_id,
+                    row.target_br,
+                    row.required_vehicle_ids,
+                    row.excluded_vehicle_ids,
+                    row.revision,
+                ) = (
+                    selected_preset_id,
+                    target_br,
+                    list(required_vehicle_ids),
+                    list(excluded_vehicle_ids),
+                    current + 1,
+                )
+            return StoredAdvisorContext(
+                profile_id,
+                row.selected_preset_id,
+                row.target_br,
+                tuple(row.required_vehicle_ids),
+                tuple(row.excluded_vehicle_ids),
+                row.revision,
+            )
 
     def reconcile_profile_aliases(
         self,

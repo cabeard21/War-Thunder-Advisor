@@ -346,6 +346,7 @@ class UserProfileRow(Base):
     include_event_vehicles: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     include_pack_vehicles: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    write_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
 class UserVehicleStateRow(Base):
@@ -362,6 +363,59 @@ class UserVehicleStateRow(Base):
     superseded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     superseded_by_vehicle_id: Mapped[str | None] = mapped_column(String(160))
+
+
+class LineupPresetRow(Base):
+    __tablename__ = "lineup_presets"
+    __table_args__ = (
+        UniqueConstraint("profile_id", "normalized_name", name="uq_preset_profile_name"),
+    )
+    preset_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("user_profiles.profile_id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    normalized_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    slots: Mapped[Any] = mapped_column(JSON, nullable=False)
+    required_vehicle_ids: Mapped[Any] = mapped_column(JSON, nullable=False)
+    excluded_vehicle_ids: Mapped[Any] = mapped_column(JSON, nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AdvisorContextRow(Base):
+    __tablename__ = "advisor_contexts"
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("user_profiles.profile_id", ondelete="CASCADE"), primary_key=True
+    )
+    selected_preset_id: Mapped[str | None] = mapped_column(
+        ForeignKey("lineup_presets.preset_id", ondelete="SET NULL")
+    )
+    target_br: Mapped[int | None] = mapped_column(Integer)
+    required_vehicle_ids: Mapped[Any] = mapped_column(JSON, nullable=False)
+    excluded_vehicle_ids: Mapped[Any] = mapped_column(JSON, nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class StoredEvaluationRow(Base):
+    """Immutable, fully captured result of an explicit M3 evaluation."""
+
+    __tablename__ = "stored_evaluations"
+    evaluation_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("user_profiles.profile_id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(30), nullable=False)
+    profile_revision: Mapped[str] = mapped_column(String(80), nullable=False)
+    profile_state: Mapped[Any] = mapped_column(JSON, nullable=False)
+    effective_inputs: Mapped[Any] = mapped_column(JSON, nullable=False)
+    evidence_context: Mapped[Any] = mapped_column(JSON, nullable=False)
+    ruleset_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    schema_revision: Mapped[str] = mapped_column(String(20), nullable=False)
+    result_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    result_payload: Mapped[Any] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class ProfileReconciliationAuditRow(Base):

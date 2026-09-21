@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
+from copy import copy
 from datetime import UTC, date, datetime
 from itertools import combinations
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from wt_advisor.data.freshness import evaluate_freshness
 from wt_advisor.data.imports.statistics import (
@@ -321,9 +323,7 @@ class AdvisorService:
         )
         selected_owned = (
             frozenset(
-                row.vehicle_id
-                for row in bundle.user_states
-                if row.status is VehicleStatus.OWNED
+                row.vehicle_id for row in bundle.user_states if row.status is VehicleStatus.OWNED
             )
             if owned is None
             else owned
@@ -358,6 +358,7 @@ class AdvisorService:
                 ),
                 override_revision="m2-no-curated-corrections",
                 ruleset_hash=ruleset.content_hash,
+                # Frozen M2 fixtures deliberately retain their historical identity.
                 schema_revision="0004",
             ),
             resolved_availability=resolved_availability,
@@ -401,8 +402,7 @@ class AdvisorService:
             for vehicle in vehicles
         }
         battle_ratings = {
-            vehicle_id: resolved.value
-            for vehicle_id, resolved in resolved_battle_ratings.items()
+            vehicle_id: resolved.value for vehicle_id, resolved in resolved_battle_ratings.items()
         }
         statistics = (
             ()
@@ -477,7 +477,7 @@ class AdvisorService:
                 snapshots=active_snapshots,
                 override_revision=overrides.revision,
                 ruleset_hash=ruleset.content_hash,
-                schema_revision="0004",
+                schema_revision="0005",
             ),
             resolved_availability=resolved_availability,
             capability_resolutions=capability_resolutions,
@@ -614,12 +614,7 @@ class AdvisorService:
                 DatasetType.RESEARCH_GRAPH,
                 graph_snapshot,
                 total_count=len(self._vehicles),
-                covered_count=len(
-                    {
-                        _research_edge_parts(edge)[1]
-                        for edge in self._research_edges
-                    }
-                ),
+                covered_count=len({_research_edge_parts(edge)[1] for edge in self._research_edges}),
                 available=bool(self._research_edges),
                 as_of=self._evaluation_date,
             ),
@@ -648,9 +643,7 @@ class AdvisorService:
             "newest_stored": {
                 "vehicle_snapshot": newest_vehicle.model_dump(mode="json"),
                 "statistics_snapshot": (
-                    None
-                    if newest_statistics is None
-                    else newest_statistics.model_dump(mode="json")
+                    None if newest_statistics is None else newest_statistics.model_dump(mode="json")
                 ),
             },
             "compatibility": {
@@ -682,8 +675,7 @@ class AdvisorService:
                 "statistics_period": {
                     "start": (
                         None
-                        if statistics_snapshot is None
-                        or statistics_snapshot.sample_start is None
+                        if statistics_snapshot is None or statistics_snapshot.sample_start is None
                         else statistics_snapshot.sample_start.isoformat()
                     ),
                     "end": (
@@ -700,9 +692,7 @@ class AdvisorService:
                     None if capability_snapshot is None else capability_snapshot.snapshot_id
                 ),
                 "availability_snapshot_id": (
-                    None
-                    if availability_snapshot is None
-                    else availability_snapshot.snapshot_id
+                    None if availability_snapshot is None else availability_snapshot.snapshot_id
                 ),
                 "identity_snapshot_id": (
                     None if identity_snapshot is None else identity_snapshot.snapshot_id
@@ -783,9 +773,7 @@ class AdvisorService:
         """Inspect a local statistics export without mutating evidence storage."""
 
         payload = _read_bounded_file(source, MAX_IMPORT_BYTES)
-        return self._inspect_statistics_payload(
-            source, payload, provider=provider, purpose=purpose
-        )
+        return self._inspect_statistics_payload(source, payload, provider=provider, purpose=purpose)
 
     def _inspect_statistics_payload(
         self,
@@ -889,8 +877,7 @@ class AdvisorService:
 
     def _statistics_identity_aliases(self, provider: str) -> dict[str, str]:
         aliases = {
-            vehicle.source_vehicle_id: vehicle.vehicle_id
-            for vehicle in self._vehicles.values()
+            vehicle.source_vehicle_id: vehicle.vehicle_id for vehicle in self._vehicles.values()
         }
         if (
             self._repository is not None
@@ -918,13 +905,27 @@ class AdvisorService:
         )
 
     def set_user_vehicle_status(
-        self, profile_id: str, vehicle_id: str, status: VehicleStatus
+        self,
+        profile_id: str,
+        vehicle_id: str,
+        status: VehicleStatus,
+        *,
+        expected_revision: str | None = None,
+        expected_write_revision: str | None = None,
     ) -> VehicleStatusChange:
+        if expected_revision is not None and expected_write_revision is not None:
+            raise ValueError("expected_revision and expected_write_revision are mutually exclusive")
         self._resolve_profile_id(profile_id)
         self._require_vehicle(vehicle_id)
         before = self._statuses.get(vehicle_id, VehicleStatus.UNKNOWN)
         if self._repository is not None:
-            self._repository.set_vehicle_status(self._profile.profile_id, vehicle_id, status)
+            self._repository.set_vehicle_status(
+                self._profile.profile_id,
+                vehicle_id,
+                status,
+                expected_revision=expected_revision,
+                expected_write_revision=expected_write_revision,
+            )
             self._statuses = self._repository.get_user_vehicle_states(self._profile.profile_id)
         elif before is not status:
             self._statuses = {**self._statuses, vehicle_id: status}
@@ -935,6 +936,208 @@ class AdvisorService:
             after_status=status,
             revision=stable_hash(dict(sorted(self._statuses.items()))),
         )
+
+    def get_profile_write_revision(self, profile_id: str) -> str:
+        """Return the persisted monotonic token for an optional guarded write."""
+
+        stored = self._repository_required().get_profile(self._resolve_profile_id(profile_id))
+        if stored is None:
+            raise LookupError(f"unknown profile {profile_id!r}")
+        return f"write-rev-{stored.write_revision}"
+
+    def evaluate_and_store(
+        self,
+        *,
+        profile_id: str,
+        target_br: int | None = None,
+        top_n: int = 10,
+        hypothetical_owned: frozenset[str] = frozenset(),
+        required_vehicle_ids: frozenset[str] | None = None,
+        excluded_vehicle_ids: frozenset[str] = frozenset(),
+        allow_partial: bool = False,
+        preset_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Calculate from one captured profile snapshot, then retain the result."""
+
+        resolved_profile = self._resolve_profile_id(profile_id)
+        repository = self._repository_required()
+        captured = repository.capture_evaluation_snapshot(
+            resolved_profile, preset_id=preset_id
+        )
+        captured_statuses = dict(sorted(captured.vehicle_statuses.items()))
+        progress = UserProgress(
+            profile=captured.profile.to_domain(),
+            vehicle_statuses=captured_statuses,
+            revision=stable_hash(captured_statuses),
+        )
+        frozen = copy(self)
+        frozen._profile = progress.profile
+        frozen._statuses = dict(captured_statuses)
+        frozen._repository = None
+        frozen._bundle_resolution = self._bundle_resolution
+        preset_slots = () if captured.preset is None else captured.preset.slots
+        preset_required = (
+            () if captured.preset is None else captured.preset.required_vehicle_ids
+        )
+        preset_excluded = (
+            () if captured.preset is None else captured.preset.excluded_vehicle_ids
+        )
+        requested_required = tuple(sorted(required_vehicle_ids or ()))
+        requested_excluded = tuple(sorted(excluded_vehicle_ids))
+        effective_target_br = target_br if target_br is not None else captured.context.target_br
+        effective_required = frozenset(
+            (
+                *captured.context.required_vehicle_ids,
+                *preset_slots,
+                *preset_required,
+                *requested_required,
+            )
+        )
+        effective_excluded = frozenset(
+            (*captured.context.excluded_vehicle_ids, *preset_excluded, *requested_excluded)
+        )
+        effective_inputs = {
+            "target_br": effective_target_br,
+            "top_n": top_n,
+            "hypothetical_owned": sorted(hypothetical_owned),
+            "required_vehicle_ids": sorted(effective_required),
+            "excluded_vehicle_ids": sorted(effective_excluded),
+            "allow_partial": allow_partial,
+            "preset_slots": list(preset_slots),
+            "requested_target_br": target_br,
+            "requested_required_vehicle_ids": list(requested_required),
+            "requested_excluded_vehicle_ids": list(requested_excluded),
+            "context_revision": f"rev-{captured.context.revision}",
+            "source_context_constraints_hash": stable_hash(
+                {
+                    "target_br": captured.context.target_br,
+                    "required_vehicle_ids": sorted(captured.context.required_vehicle_ids),
+                    "excluded_vehicle_ids": sorted(captured.context.excluded_vehicle_ids),
+                }
+            ),
+            "source_preset_id": None if captured.preset is None else captured.preset.preset_id,
+            "source_preset_revision": (
+                None if captured.preset is None else f"rev-{captured.preset.revision}"
+            ),
+        }
+        result = frozen.generate_lineups(
+            profile_id=resolved_profile,
+            target_br=effective_target_br,
+            top_n=top_n,
+            hypothetical_owned=hypothetical_owned,
+            required_vehicle_ids=(
+                None if not effective_required and not effective_excluded else effective_required
+            ),
+            excluded_vehicle_ids=effective_excluded,
+            allow_partial=allow_partial,
+        )
+        payload = result.model_dump(mode="json")
+        # Each explicit run is an immutable historical record. The deterministic
+        # calculation identity remains result.analysis_id.
+        evaluation_id = uuid4().hex
+        stored = repository.store_evaluation(
+            evaluation_id=evaluation_id,
+            profile_id=resolved_profile,
+            kind="generation",
+            profile_revision=progress.revision,
+            profile_state=progress.model_dump(mode="json"),
+            effective_inputs=effective_inputs,
+            evidence_context=self._evidence_context.model_dump(mode="json"),
+            ruleset_hash=self._evidence_context.ruleset_hash,
+            schema_revision=self._evidence_context.schema_revision,
+            result_id=result.analysis_id,
+            result_payload=payload,
+        )
+        return self._stored_evaluation_payload(stored, stale=False, stale_reasons=())
+
+    def reevaluate_stored_evaluation(
+        self, profile_id: str, evaluation_id: str
+    ) -> dict[str, Any]:
+        """Explicitly rerun a stored generation using its saved effective inputs."""
+
+        previous = self._repository_required().get_stored_evaluation(
+            self._resolve_profile_id(profile_id), evaluation_id
+        )
+        if previous is None:
+            raise LookupError("unknown stored evaluation")
+        inputs = previous.effective_inputs
+        return self.evaluate_and_store(
+            profile_id=profile_id,
+            target_br=inputs.get("requested_target_br", inputs.get("target_br")),
+            top_n=int(inputs.get("top_n", 10)),
+            hypothetical_owned=frozenset(inputs.get("hypothetical_owned", ())),
+            required_vehicle_ids=frozenset(
+                inputs.get("requested_required_vehicle_ids", inputs.get("required_vehicle_ids", ()))
+            ),
+            excluded_vehicle_ids=frozenset(
+                inputs.get("requested_excluded_vehicle_ids", inputs.get("excluded_vehicle_ids", ()))
+            ),
+            allow_partial=bool(inputs.get("allow_partial", False)),
+            preset_id=inputs.get("source_preset_id"),
+        )
+
+    def get_stored_evaluation(self, profile_id: str, evaluation_id: str) -> dict[str, Any]:
+        stored = self._repository_required().get_stored_evaluation(
+            self._resolve_profile_id(profile_id), evaluation_id
+        )
+        if stored is None:
+            raise LookupError("unknown stored evaluation")
+        current_progress = self.get_user_progress(profile_id).revision
+        reasons = []
+        if stored.profile_revision != current_progress:
+            reasons.append("profile_garage_state_changed")
+        if stored.ruleset_hash != self._evidence_context.ruleset_hash:
+            reasons.append("ruleset_changed")
+        if stored.evidence_context != self._evidence_context.model_dump(mode="json"):
+            reasons.append("evidence_changed")
+        saved_context_constraints_hash = stored.effective_inputs.get(
+            "source_context_constraints_hash"
+        )
+        if saved_context_constraints_hash is not None:
+            current_context = self._repository_required().get_advisor_context(stored.profile_id)
+            current_context_constraints_hash = stable_hash(
+                {
+                    "target_br": current_context.target_br,
+                    "required_vehicle_ids": sorted(current_context.required_vehicle_ids),
+                    "excluded_vehicle_ids": sorted(current_context.excluded_vehicle_ids),
+                }
+            )
+            if current_context_constraints_hash != saved_context_constraints_hash:
+                reasons.append("effective_constraints_changed")
+        source_preset_id = stored.effective_inputs.get("source_preset_id")
+        source_preset_revision = stored.effective_inputs.get("source_preset_revision")
+        if source_preset_id is not None:
+            current = next(
+                (
+                    preset
+                    for preset in self._repository_required().list_presets(stored.profile_id)
+                    if preset.preset_id == source_preset_id
+                ),
+                None,
+            )
+            current_revision = None if current is None else f"rev-{current.revision}"
+            if current_revision != source_preset_revision:
+                reasons.append("source_preset_changed")
+        return self._stored_evaluation_payload(
+            stored, stale=bool(reasons), stale_reasons=tuple(reasons)
+        )
+
+    @staticmethod
+    def _stored_evaluation_payload(
+        stored: Any, *, stale: bool, stale_reasons: tuple[str, ...]
+    ) -> dict[str, Any]:
+        return {
+            "evaluation_id": stored.evaluation_id,
+            "kind": stored.kind,
+            "profile_revision": stored.profile_revision,
+            "effective_inputs": stored.effective_inputs,
+            "evidence_context": stored.evidence_context,
+            "result_id": stored.result_id,
+            "result": stored.result_payload,
+            "created_at": stored.created_at.isoformat(),
+            "stale": stale,
+            "stale_reasons": stale_reasons,
+        }
 
     def reconcile_profile(
         self,
@@ -964,9 +1167,7 @@ class AdvisorService:
             apply=apply,
         )
         if apply and outcome.applied:
-            self._statuses = self._repository.get_user_vehicle_states(
-                self._profile.profile_id
-            )
+            self._statuses = self._repository.get_user_vehicle_states(self._profile.profile_id)
         resulting_revision = stable_hash(dict(sorted(self._statuses.items())))
         public_plan_payload = {
             "profile_id": outcome.plan.profile_id,
@@ -986,6 +1187,96 @@ class AdvisorService:
             resulting_revision=resulting_revision,
         )
 
+    def _repository_required(self) -> EvidenceRepository:
+        if self._repository is None:
+            raise ValueError("durable presets require a database-backed service")
+        return self._repository
+
+    def _validate_preset(
+        self, slots: Sequence[str], required: Sequence[str], excluded: Sequence[str]
+    ) -> None:
+        for vehicle_id in (*slots, *required, *excluded):
+            self._require_vehicle(vehicle_id)
+        if len(set(slots)) != len(slots):
+            raise ValueError("duplicate vehicle selections")
+        if len(slots) > self._profile.crew_slots:
+            raise ValueError("preset exceeds configured crew slots")
+        if set(required) & set(excluded):
+            raise ValueError("required and excluded vehicle IDs overlap")
+
+    def create_preset(
+        self,
+        profile_id: str,
+        *,
+        name: str,
+        slots: Sequence[str],
+        required_vehicle_ids: Sequence[str] = (),
+        excluded_vehicle_ids: Sequence[str] = (),
+    ) -> Any:
+        resolved = self._resolve_profile_id(profile_id)
+        self._validate_preset(slots, required_vehicle_ids, excluded_vehicle_ids)
+        return self._repository_required().create_preset(
+            resolved,
+            preset_id=str(uuid4()),
+            name=name,
+            slots=tuple(slots),
+            required_vehicle_ids=tuple(sorted(required_vehicle_ids)),
+            excluded_vehicle_ids=tuple(sorted(excluded_vehicle_ids)),
+        )
+
+    def list_presets(self, profile_id: str) -> Any:
+        return self._repository_required().list_presets(self._resolve_profile_id(profile_id))
+
+    def update_preset(
+        self,
+        profile_id: str,
+        preset_id: str,
+        *,
+        name: str,
+        slots: Sequence[str],
+        required_vehicle_ids: Sequence[str],
+        excluded_vehicle_ids: Sequence[str],
+        expected_revision: str,
+    ) -> Any:
+        self._validate_preset(slots, required_vehicle_ids, excluded_vehicle_ids)
+        return self._repository_required().update_preset(
+            self._resolve_profile_id(profile_id),
+            preset_id,
+            name=name,
+            slots=tuple(slots),
+            required_vehicle_ids=tuple(sorted(required_vehicle_ids)),
+            excluded_vehicle_ids=tuple(sorted(excluded_vehicle_ids)),
+            expected_revision=expected_revision,
+        )
+
+    def delete_preset(self, profile_id: str, preset_id: str, *, expected_revision: str) -> None:
+        self._repository_required().delete_preset(
+            self._resolve_profile_id(profile_id), preset_id, expected_revision=expected_revision
+        )
+
+    def get_advisor_context(self, profile_id: str) -> Any:
+        return self._repository_required().get_advisor_context(self._resolve_profile_id(profile_id))
+
+    def update_advisor_context(
+        self,
+        profile_id: str,
+        *,
+        selected_preset_id: str | None,
+        target_br: int | None = None,
+        required_vehicle_ids: Sequence[str] = (),
+        excluded_vehicle_ids: Sequence[str] = (),
+        expected_revision: str,
+    ) -> Any:
+        self._validate_preset((), required_vehicle_ids, excluded_vehicle_ids)
+        return self._repository_required().update_advisor_context(
+            self._resolve_profile_id(profile_id),
+            selected_preset_id=selected_preset_id,
+            target_br=target_br,
+            required_vehicle_ids=tuple(sorted(required_vehicle_ids)),
+            excluded_vehicle_ids=tuple(sorted(excluded_vehicle_ids)),
+            expected_revision=expected_revision,
+        )
+
     def analyze_lineup(self, vehicle_ids: Sequence[str]) -> LineupAnalysis:
         if not vehicle_ids:
             raise ValueError("lineup must contain at least one vehicle")
@@ -997,8 +1288,7 @@ class AdvisorService:
         if {vehicle.nation for vehicle in vehicles} != {self._profile.nation}:
             raise ValueError("all lineup vehicles must match the profile nation")
         resolved_brs = {
-            vehicle.vehicle_id: self._battle_ratings[vehicle.vehicle_id]
-            for vehicle in vehicles
+            vehicle.vehicle_id: self._battle_ratings[vehicle.vehicle_id] for vehicle in vehicles
         }
         lineup_br = max(resolved_brs.values())
         nearby_spaa = self._nearby_spaa(lineup_br)
@@ -1062,16 +1352,28 @@ class AdvisorService:
         top_n: int = 10,
         hypothetical_owned: frozenset[str] = frozenset(),
         required_vehicle_id: str | None = None,
+        required_vehicle_ids: frozenset[str] | None = None,
+        excluded_vehicle_ids: frozenset[str] = frozenset(),
         allow_partial: bool = False,
     ) -> GenerationResult:
         self._resolve_profile_id(profile_id)
+        if required_vehicle_id is not None and required_vehicle_ids is not None:
+            raise ValueError("singular and plural required vehicle inputs are ambiguous")
+        required = (
+            frozenset({required_vehicle_id})
+            if required_vehicle_ids is None and required_vehicle_id
+            else (required_vehicle_ids or frozenset())
+        )
+        if required & excluded_vehicle_ids:
+            raise ValueError("required and excluded vehicle IDs overlap")
         if top_n < 1 or top_n > 100:
             raise ValueError("top_n must be between 1 and 100")
         eligible = self._eligible_owned(hypothetical_owned)
-        if required_vehicle_id is not None:
-            self._require_vehicle(required_vehicle_id)
-            if required_vehicle_id not in eligible:
+        for vehicle_id in required:
+            self._require_vehicle(vehicle_id)
+            if vehicle_id not in eligible:
                 raise ValueError("required vehicle is not eligible under profile ownership policy")
+        eligible = tuple(item for item in eligible if item not in excluded_vehicle_ids)
         if not eligible:
             raise ValueError("no eligible owned vehicles")
         if len(eligible) < self._profile.crew_slots and not allow_partial:
@@ -1084,7 +1386,7 @@ class AdvisorService:
             raise ValueError("candidate combination guard exceeded")
         grouped: dict[int, list[CandidateLineup]] = defaultdict(list)
         for vehicle_ids in combinations(eligible, slot_count):
-            if required_vehicle_id is not None and required_vehicle_id not in vehicle_ids:
+            if required and not required.issubset(vehicle_ids):
                 continue
             analysis = self.analyze_lineup(vehicle_ids)
             if target_br is not None and analysis.lineup_br != target_br:
@@ -1106,7 +1408,14 @@ class AdvisorService:
             "target_br": target_br,
             "top_n": top_n,
             "hypothetical_owned": sorted(hypothetical_owned),
-            "required_vehicle_id": required_vehicle_id,
+            **(
+                {"required_vehicle_id": required_vehicle_id}
+                if required_vehicle_ids is None
+                else {
+                    "required_vehicle_ids": sorted(required),
+                    "excluded_vehicle_ids": sorted(excluded_vehicle_ids),
+                }
+            ),
             "allow_partial": allow_partial,
             "groups": [group.model_dump(mode="json") for group in groups],
             "evidence": self._evidence_context.model_dump(mode="json"),
@@ -1119,9 +1428,7 @@ class AdvisorService:
             evidence_context=self._evidence_context,
         )
 
-    def compare_lineups(
-        self, lineup_a: Sequence[str], lineup_b: Sequence[str]
-    ) -> LineupComparison:
+    def compare_lineups(self, lineup_a: Sequence[str], lineup_b: Sequence[str]) -> LineupComparison:
         analysis_a = self.analyze_lineup(lineup_a)
         analysis_b = self.analyze_lineup(lineup_b)
         deltas = _component_deltas(analysis_a, analysis_b)
@@ -1202,19 +1509,14 @@ class AdvisorService:
             prerequisites = self._research_prerequisites(vehicle_id)
             adopted = vehicle_id in best.analysis.lineup.slots
             readiness_changes = _readiness_changes(current.analysis, best.analysis)
-            role_changes = _role_changes(
-                current.analysis, best.analysis, self._vehicles
-            )
+            role_changes = _role_changes(current.analysis, best.analysis, self._vehicles)
             opens_new_frontier = (
                 best.analysis.readiness_passed
                 and best.analysis.lineup_br > current.analysis.lineup_br
             )
-            improves_frontier = (
-                best.analysis.lineup_br == current.analysis.lineup_br
-                and (
-                    (not current.analysis.readiness_passed and best.analysis.readiness_passed)
-                    or best.analysis.overall_score > current.analysis.overall_score
-                )
+            improves_frontier = best.analysis.lineup_br == current.analysis.lineup_br and (
+                (not current.analysis.readiness_passed and best.analysis.readiness_passed)
+                or best.analysis.overall_score > current.analysis.overall_score
             )
             output.append(
                 UnlockEvaluation(
@@ -1248,9 +1550,7 @@ class AdvisorService:
                     adopted_immediately=adopted,
                     opens_new_ready_frontier=opens_new_frontier,
                     improves_existing_frontier=improves_frontier,
-                    fills_missing_role=any(
-                        change.startswith("added:") for change in role_changes
-                    ),
+                    fills_missing_role=any(change.startswith("added:") for change in role_changes),
                     provides_stronger_backup=(
                         adopted
                         and not opens_new_frontier
@@ -1297,41 +1597,26 @@ class AdvisorService:
             if vehicle.nation is not self._profile.nation:
                 continue
             availability = self._resolved_availability.get(vehicle_id)
-            acquisition_type = (
-                availability.acquisition_type if availability is not None else None
-            )
+            acquisition_type = availability.acquisition_type if availability is not None else None
             if (
-                (
-                    acquisition_type is AcquisitionType.PREMIUM
-                    or (
-                        acquisition_type is None
-                        and vehicle.availability_type is AvailabilityType.PREMIUM
-                    )
+                acquisition_type is AcquisitionType.PREMIUM
+                or (
+                    acquisition_type is None
+                    and vehicle.availability_type is AvailabilityType.PREMIUM
                 )
-                and not self._profile.include_premiums
-            ):
+            ) and not self._profile.include_premiums:
                 continue
             if (
-                (
-                    acquisition_type is AcquisitionType.EVENT
-                    or (
-                        acquisition_type is None
-                        and vehicle.availability_type is AvailabilityType.EVENT
-                    )
+                acquisition_type is AcquisitionType.EVENT
+                or (
+                    acquisition_type is None and vehicle.availability_type is AvailabilityType.EVENT
                 )
-                and not self._profile.include_event_vehicles
-            ):
+            ) and not self._profile.include_event_vehicles:
                 continue
             if (
-                (
-                    acquisition_type is AcquisitionType.PACK
-                    or (
-                        acquisition_type is None
-                        and vehicle.availability_type is AvailabilityType.PACK
-                    )
-                )
-                and not self._profile.include_pack_vehicles
-            ):
+                acquisition_type is AcquisitionType.PACK
+                or (acquisition_type is None and vehicle.availability_type is AvailabilityType.PACK)
+            ) and not self._profile.include_pack_vehicles:
                 continue
             eligible.append(vehicle_id)
         return tuple(eligible)
@@ -1354,9 +1639,7 @@ class AdvisorService:
             sorted(
                 vehicle_id
                 for vehicle_id in candidates
-                if _prerequisites_satisfied(
-                    prerequisites.get(vehicle_id, ()), self._statuses
-                )
+                if _prerequisites_satisfied(prerequisites.get(vehicle_id, ()), self._statuses)
             )
         )
 
@@ -1367,10 +1650,7 @@ class AdvisorService:
                 resolved is not None
                 and resolved.researchability is Researchability.NORMALLY_RESEARCHABLE
             )
-        return (
-            self._vehicles[vehicle_id].availability_type
-            is AvailabilityType.RESEARCH_TREE
-        )
+        return self._vehicles[vehicle_id].availability_type is AvailabilityType.RESEARCH_TREE
 
     def _research_prerequisites(self, vehicle_id: str) -> tuple[str, ...]:
         return tuple(
@@ -1572,14 +1852,10 @@ def _component_status(
         "dataset_type": dataset_type.value,
         "status": status,
         "selected_snapshot_id": None if snapshot is None else snapshot.snapshot_id,
-        "newest_snapshot_id": (
-            None if newest_selected is None else newest_selected.snapshot_id
-        ),
+        "newest_snapshot_id": (None if newest_selected is None else newest_selected.snapshot_id),
         "provider": None if snapshot is None else snapshot.provider,
         "purpose": None if snapshot is None else snapshot.purpose.value,
-        "freshness": (
-            "unknown" if refreshed is None else refreshed.freshness.value
-        ),
+        "freshness": ("unknown" if refreshed is None else refreshed.freshness.value),
         "compatible": is_available,
         "reason": reason,
         "total_count": total_count,
@@ -1591,15 +1867,9 @@ def _component_status(
     }
 
 
-def _snapshot_of_type(
-    context: EvidenceContext, dataset_type: DatasetType
-) -> SnapshotRef | None:
+def _snapshot_of_type(context: EvidenceContext, dataset_type: DatasetType) -> SnapshotRef | None:
     return next(
-        (
-            snapshot
-            for snapshot in context.snapshots
-            if snapshot.dataset_type is dataset_type
-        ),
+        (snapshot for snapshot in context.snapshots if snapshot.dataset_type is dataset_type),
         None,
     )
 
@@ -1653,7 +1923,9 @@ def _lower_alternative(
         else (
             recommended.analysis.lineup_br
             if recommended is not None
-            else groups[-1].lineup_br if groups else None
+            else groups[-1].lineup_br
+            if groups
+            else None
         )
     )
     if ceiling is None:
@@ -1695,9 +1967,7 @@ def _component_deltas(before: LineupAnalysis, after: LineupAnalysis) -> dict[str
     }
 
 
-def _readiness_changes(
-    before: LineupAnalysis, after: LineupAnalysis
-) -> tuple[str, ...]:
+def _readiness_changes(before: LineupAnalysis, after: LineupAnalysis) -> tuple[str, ...]:
     previous = set(before.readiness_failures)
     current = set(after.readiness_failures)
     return tuple(

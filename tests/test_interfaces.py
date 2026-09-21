@@ -90,7 +90,7 @@ async def test_mcp_lists_all_milestone_tools_and_returns_structured_data() -> No
         tool_names = {tool.name for tool in tools.tools}
         result = await client.call_tool("get_data_status", {})
 
-    assert tool_names == {
+    assert {
         "get_data_status",
         "list_vehicles",
         "get_vehicle",
@@ -102,7 +102,18 @@ async def test_mcp_lists_all_milestone_tools_and_returns_structured_data() -> No
         "generate_lineups",
         "suggest_lineup_additions",
         "evaluate_next_unlocks",
-    }
+    }.issubset(tool_names)
+    assert {
+        "list_presets",
+        "create_preset",
+        "update_preset",
+        "delete_preset",
+        "get_advisor_context",
+        "update_advisor_context",
+        "evaluate_and_store",
+        "get_stored_evaluation",
+        "reevaluate_stored_evaluation",
+    }.issubset(tool_names)
     assert result.structured_content is not None
     assert result.structured_content["schema_revision"]
 
@@ -259,6 +270,159 @@ def test_cli_profile_reconcile_rejects_conflicting_modes() -> None:
     assert result.exit_code != 0
     assert "mutually exclusive" in result.output
     assert service.calls == []
+
+
+def test_cli_preset_and_context_lifecycle_use_durable_service(tmp_path: Path) -> None:
+    service = AdvisorService.from_database(tmp_path / "advisor.sqlite")
+    cli = create_app(service)
+
+    created_result = CliRunner().invoke(
+        cli,
+        [
+            "preset",
+            "create",
+            "First lineup",
+            "--slot",
+            "us_m2a4",
+            "--required-vehicle-id",
+            "us_m2a4",
+            "--json",
+        ],
+    )
+    assert created_result.exit_code == 0, created_result.output
+    created = json.loads(created_result.stdout)
+
+    context = service.get_advisor_context("acceptance")
+    selected_result = CliRunner().invoke(
+        cli,
+        [
+            "context",
+            "update",
+            "--selected-preset",
+            created["preset_id"],
+            "--expected-revision",
+            str(context.revision),
+            "--json",
+        ],
+    )
+    assert selected_result.exit_code == 0, selected_result.output
+    assert json.loads(selected_result.stdout)["selected_preset_id"] == created["preset_id"]
+
+    listed_result = CliRunner().invoke(cli, ["preset", "list", "--json"])
+    assert listed_result.exit_code == 0, listed_result.output
+    assert json.loads(listed_result.stdout)[0]["name"] == "First lineup"
+
+    updated_result = CliRunner().invoke(
+        cli,
+        [
+            "preset",
+            "update",
+            created["preset_id"],
+            "--name",
+            "Renamed",
+            "--slot",
+            "us_m2a4",
+            "--expected-revision",
+            str(created["revision"]),
+            "--json",
+        ],
+    )
+    assert updated_result.exit_code == 0, updated_result.output
+    updated = json.loads(updated_result.stdout)
+    assert updated["name"] == "Renamed"
+
+    deleted_result = CliRunner().invoke(
+        cli,
+        [
+            "preset",
+            "delete",
+            created["preset_id"],
+            "--expected-revision",
+            str(updated["revision"]),
+            "--json",
+        ],
+    )
+    assert deleted_result.exit_code == 0, deleted_result.output
+    assert json.loads(deleted_result.stdout) == {"deleted": True}
+
+
+@pytest.mark.asyncio
+async def test_cli_and_mcp_evaluation_operations_return_same_stored_contract(
+    tmp_path: Path,
+) -> None:
+    service = AdvisorService.from_database(tmp_path / "advisor.sqlite")
+    cli_result = CliRunner().invoke(
+        create_app(service),
+        ["evaluation", "create", "--profile", "acceptance", "--top", "2", "--json"],
+    )
+    assert cli_result.exit_code == 0, cli_result.output
+    created = json.loads(cli_result.stdout)
+
+    async with Client(create_server(service)) as client:
+        read_result = await client.call_tool(
+            "get_stored_evaluation",
+            {"profile_id": "acceptance", "evaluation_id": created["evaluation_id"]},
+        )
+        reevaluated_result = await client.call_tool(
+            "reevaluate_stored_evaluation",
+            {"profile_id": "acceptance", "evaluation_id": created["evaluation_id"]},
+        )
+
+    assert read_result.structured_content is not None
+    assert read_result.structured_content["evaluation_id"] == created["evaluation_id"]
+    assert read_result.structured_content["result"] == created["result"]
+    assert reevaluated_result.structured_content is not None
+    assert reevaluated_result.structured_content["effective_inputs"] == created["effective_inputs"]
+    assert (
+        reevaluated_result.structured_content["result"]["groups"]
+        == created["result"]["groups"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_mutates_preset_and_context_lifecycle(tmp_path: Path) -> None:
+    service = AdvisorService.from_database(tmp_path / "advisor.sqlite")
+
+    async with Client(create_server(service)) as client:
+        created_result = await client.call_tool(
+            "create_preset",
+            {"profile_id": "acceptance", "name": "First", "slots": ["us_m2a4"]},
+        )
+        assert created_result.structured_content is not None
+        created = created_result.structured_content
+        updated_result = await client.call_tool(
+            "update_preset",
+            {
+                "profile_id": "acceptance",
+                "preset_id": created["preset_id"],
+                "name": "Renamed",
+                "slots": ["us_m2a4"],
+                "expected_revision": str(created["revision"]),
+            },
+        )
+        assert updated_result.structured_content is not None
+        updated = updated_result.structured_content
+        context_result = await client.call_tool("get_advisor_context", {})
+        assert context_result.structured_content is not None
+        selected_result = await client.call_tool(
+            "update_advisor_context",
+            {
+                "selected_preset_id": created["preset_id"],
+                "expected_revision": str(context_result.structured_content["revision"]),
+            },
+        )
+        deleted_result = await client.call_tool(
+            "delete_preset",
+            {
+                "preset_id": created["preset_id"],
+                "expected_revision": str(updated["revision"]),
+            },
+        )
+
+    assert updated["name"] == "Renamed"
+    assert selected_result.structured_content is not None
+    assert selected_result.structured_content["selected_preset_id"] == created["preset_id"]
+    assert deleted_result.structured_content == {"deleted": True}
 
 
 @pytest.mark.parametrize("command", ["inspect", "import"])

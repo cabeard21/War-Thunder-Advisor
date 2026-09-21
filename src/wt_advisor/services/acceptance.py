@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from wt_advisor.data.providers.fixture import FixtureProvider
-from wt_advisor.domain.models import CandidateLineup, GenerationResult
+from wt_advisor.domain.models import CandidateLineup, GenerationResult, VehicleStatus
 from wt_advisor.services.advisor import AdvisorService
 
 
@@ -254,6 +256,75 @@ def build_m2_acceptance_report() -> dict[str, Any]:
         "scenarios": scenario_reports,
         "passed": all(item["passed"] for item in scenario_reports),
     }
+
+
+def build_m3_acceptance_report(_: AdvisorService) -> dict[str, Any]:
+    """Run M3 persistence checks in a disposable database, never the user's DB."""
+
+    with TemporaryDirectory(prefix="wt-advisor-m3-acceptance-") as temporary:
+        service = AdvisorService.from_database(Path(temporary) / "acceptance.sqlite")
+        baseline = service.generate_lineups(profile_id="acceptance", top_n=2)
+        constrained = service.generate_lineups(
+        profile_id="acceptance",
+        required_vehicle_ids=frozenset({"us_m2a4"}),
+        top_n=2,
+        )
+        ambiguous_rejected = False
+        try:
+            service.generate_lineups(
+                profile_id="acceptance",
+                required_vehicle_id="us_m2a4",
+                required_vehicle_ids=frozenset({"us_m2a4"}),
+            )
+        except ValueError as exc:
+            ambiguous_rejected = "singular and plural" in str(exc)
+        stored = service.evaluate_and_store(profile_id="acceptance", top_n=2)
+        stored_read = service.get_stored_evaluation("acceptance", stored["evaluation_id"])
+        preset = service.create_preset("acceptance", name="Acceptance", slots=("us_m2a4",))
+        context = service.get_advisor_context("acceptance")
+        service.update_advisor_context(
+            "acceptance",
+            selected_preset_id=preset.preset_id,
+            expected_revision=str(context.revision),
+        )
+        restarted = AdvisorService.from_database(Path(temporary) / "acceptance.sqlite")
+        revision = restarted.get_user_progress("acceptance").revision
+        restarted.set_user_vehicle_status(
+            "acceptance", "us_m3_lee", VehicleStatus.OWNED, expected_revision=revision
+        )
+        conflict_rejected = False
+        try:
+            service.set_user_vehicle_status(
+                "acceptance", "us_m3_lee", VehicleStatus.LOCKED, expected_revision=revision
+            )
+        except ValueError:
+            conflict_rejected = True
+        recommendation = constrained.recommended
+        checks = {
+            "baseline_has_deterministic_identity": bool(baseline.analysis_id),
+            "plural_required_vehicle_is_honored": (
+                recommendation is not None and "us_m2a4" in recommendation.analysis.lineup.slots
+            ),
+            "singular_plural_ambiguity_is_rejected": ambiguous_rejected,
+            "stored_result_is_passive": stored_read["result_id"] == stored["result_id"],
+            "preset_context_survives_restart": (
+                restarted.get_advisor_context("acceptance").selected_preset_id == preset.preset_id
+            ),
+            "stale_public_revision_is_rejected": conflict_rejected,
+            "runtime_schema_is_m3_head": service.data_status()["schema_revision"] == "0005",
+        }
+        report = {
+            "milestone": 3,
+            "checks": checks,
+            "passed": all(checks.values()),
+            "baseline_analysis_id": baseline.analysis_id,
+            "constrained_analysis_id": constrained.analysis_id,
+        }
+        # SQLite keeps file handles open on Windows until the engines are disposed.
+        for checked_service in (service, restarted):
+            if checked_service._repository is not None:
+                checked_service._repository.engine.dispose()
+        return report
 
 
 def render_m2_acceptance_markdown(report: dict[str, Any]) -> str:

@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>War Thunder Advisor — Windows Dashboard Acceptance</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --ink: #e9eee9; --muted: #9da99e; --panel: #151c19; --panel-2: #1b2520;
+      --line: #34443b; --field: #0b100e; --amber: #ffb23e; --green: #73db94;
+      --red: #ff746c; --blue: #7cc7ff; --shadow: 0 18px 60px #0008;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0; color: var(--ink); background:
+        linear-gradient(#ffffff05 1px, transparent 1px),
+        linear-gradient(90deg, #ffffff05 1px, transparent 1px), #090e0c;
+      background-size: 28px 28px;
+      font: 15px/1.55 "Segoe UI", system-ui, sans-serif;
+    }
+    button, textarea, input { font: inherit; }
+    button { cursor: pointer; }
+    .shell { min-height: 100vh; display: grid; grid-template-columns: 300px 1fr; }
+    aside {
+      position: sticky; top: 0; height: 100vh; padding: 28px 22px; overflow: auto;
+      border-right: 1px solid var(--line); background: #0d1411ee; backdrop-filter: blur(12px);
+    }
+    .kicker { margin: 0 0 8px; color: var(--amber); font: 700 11px/1.2 Consolas, monospace; letter-spacing: .18em; }
+    h1 { margin: 0; max-width: 12ch; font-size: 28px; line-height: 1.05; letter-spacing: -.04em; }
+    .subtitle { color: var(--muted); margin: 14px 0 20px; }
+    .meter { height: 7px; overflow: hidden; background: var(--field); border: 1px solid var(--line); }
+    .meter > i { display: block; height: 100%; width: 0; background: var(--green); transition: width .25s ease; }
+    .progress-label { display: flex; justify-content: space-between; margin: 7px 0 20px; color: var(--muted); font: 12px Consolas, monospace; }
+    nav { display: grid; gap: 5px; }
+    nav a { padding: 8px 10px; color: var(--muted); text-decoration: none; border-left: 2px solid transparent; }
+    nav a:hover, nav a.active { color: var(--ink); background: #ffffff08; border-left-color: var(--amber); }
+    .aside-actions { display: grid; gap: 8px; margin-top: 22px; }
+    main { width: min(100%, 1100px); padding: 50px clamp(24px, 5vw, 72px) 100px; }
+    .hero { display: grid; grid-template-columns: 1fr auto; gap: 24px; align-items: end; margin-bottom: 38px; }
+    .hero h2 { margin: 0; font-size: clamp(34px, 6vw, 72px); line-height: .94; letter-spacing: -.055em; max-width: 12ch; }
+    .stamp { border: 1px solid var(--amber); color: var(--amber); padding: 12px 14px; transform: rotate(-2deg); font: 700 12px Consolas, monospace; text-transform: uppercase; }
+    .notice { padding: 15px 18px; border: 1px solid #735524; background: #2a2113; color: #ffdca0; margin-bottom: 28px; }
+    .step { margin: 0 0 20px; border: 1px solid var(--line); background: var(--panel); box-shadow: var(--shadow); }
+    .step-head { display: grid; grid-template-columns: auto 1fr auto; gap: 14px; align-items: center; padding: 18px 20px; }
+    .num { color: var(--amber); font: 700 18px Consolas, monospace; }
+    .step h3 { margin: 0; font-size: 20px; }
+    .step-body { padding: 0 20px 22px 58px; }
+    .step.done { border-color: #477859; }
+    .step.done .step-head { background: #18281e; }
+    .check { width: 23px; height: 23px; accent-color: var(--green); }
+    .task-list { display: grid; gap: 9px; margin: 14px 0; }
+    .task { display: flex; gap: 10px; align-items: flex-start; color: #d6ded7; }
+    .task input { margin-top: 4px; accent-color: var(--green); }
+    .expected { border-left: 3px solid var(--green); padding: 10px 13px; background: #102018; color: #c9f4d5; }
+    .warn { border-left-color: var(--amber); background: #241d12; color: #ffe0aa; }
+    .code { position: relative; margin: 14px 0; }
+    pre { margin: 0; padding: 18px 58px 18px 18px; overflow: auto; border: 1px solid var(--line); background: var(--field); color: #d9ebdf; font: 13px/1.55 Consolas, monospace; }
+    .copy { position: absolute; right: 8px; top: 8px; padding: 5px 9px; }
+    button { border: 1px solid var(--line); background: var(--panel-2); color: var(--ink); padding: 9px 12px; }
+    button:hover { border-color: var(--amber); }
+    button.primary { background: var(--amber); color: #181006; border-color: var(--amber); font-weight: 700; }
+    button.danger { color: #ffd2cf; border-color: #75423f; }
+    textarea { width: 100%; min-height: 90px; resize: vertical; padding: 12px; color: var(--ink); background: var(--field); border: 1px solid var(--line); }
+    .result-grid { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; align-items: center; }
+    .result-grid label { padding: 9px 10px; background: #ffffff04; }
+    .result-grid input { accent-color: var(--green); }
+    .final { padding: 24px; border: 1px solid var(--line); background: var(--panel-2); }
+    .final-output { margin: 18px 0 0; white-space: pre-wrap; }
+    .pill { color: var(--muted); font: 12px Consolas, monospace; }
+    @media (max-width: 800px) {
+      .shell { display: block; } aside { position: relative; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+      nav { grid-template-columns: repeat(2, 1fr); } main { padding: 32px 18px 70px; }
+      .hero { grid-template-columns: 1fr; } .step-body { padding-left: 20px; }
+    }
+    @media print { aside, .copy, .aside-actions, .notice { display: none; } .shell { display: block; } main { padding: 0; max-width: none; } .step { break-inside: avoid; box-shadow: none; } }
+  </style>
+</head>
+<body>
+<div class="shell">
+  <aside>
+    <p class="kicker">MILESTONE 3 / MANUAL GATE</p>
+    <h1>Windows Dashboard Acceptance</h1>
+    <p class="subtitle">Installed package · disposable database · local application workflow</p>
+    <div class="meter"><i id="meter"></i></div>
+    <div class="progress-label"><span id="progress">0 / 13 complete</span><span id="percent">0%</span></div>
+    <nav id="nav"></nav>
+    <div class="aside-actions">
+      <button class="primary" id="export">Download report</button>
+      <button onclick="window.print()">Print / save PDF</button>
+      <button class="danger" id="reset">Reset checklist</button>
+    </div>
+  </aside>
+  <main>
+    <header class="hero">
+      <div><p class="kicker">FIELD VERIFICATION WORKSHEET</p><h2>Prove the installed dashboard works on Windows.</h2></div>
+      <div class="stamp">No game client required</div>
+    </header>
+    <div class="notice"><strong>Isolation rule:</strong> use only the disposable database created below. Do not point <code>WT_ADVISOR_DB</code> at either retained project database.</div>
+
+    <section class="step" id="step-1" data-title="Prepare installed copy"><div class="step-head"><span class="num">01</span><h3>Prepare an isolated installed copy</h3><input class="check step-check" type="checkbox" aria-label="Complete step 1"></div><div class="step-body">
+      <p>Run from the repository root in PowerShell.</p>
+      <div class="code"><button class="copy">Copy</button><pre>$RunRoot = Join-Path $env:TEMP ("wt-advisor-manual-" + [guid]::NewGuid().ToString("N"))
+$WheelDir = Join-Path $RunRoot "wheel"
+$VenvDir = Join-Path $RunRoot "venv"
+$Database = Join-Path $RunRoot "acceptance.sqlite"
+New-Item -ItemType Directory -Path $WheelDir | Out-Null
+python -m pip wheel . --no-deps --no-build-isolation -w $WheelDir
+python -m venv $VenvDir
+$Python = Join-Path $VenvDir "Scripts\python.exe"
+$Advisor = Join-Path $VenvDir "Scripts\wt-advisor.exe"
+$Wheel = (Get-ChildItem "$WheelDir\war_thunder_advisor-*.whl").FullName
+&amp; $Python -m pip install $Wheel
+Write-Host "Acceptance directory: $RunRoot"
+Write-Host "Database: $Database"</pre></div>
+      <p class="expected">PASS: wheel build and installation both exit successfully. Keep this PowerShell window open.</p>
+    </div></section>
+
+    <section class="step" id="step-2" data-title="Launch dashboard"><div class="step-head"><span class="num">02</span><h3>Launch the installed dashboard</h3><input class="check step-check" type="checkbox" aria-label="Complete step 2"></div><div class="step-body">
+      <div class="code"><button class="copy">Copy</button><pre>$env:WT_ADVISOR_DB = $Database
+$Dashboard = Start-Process -FilePath $Advisor -ArgumentList @("dashboard", "--port", "18765") -WorkingDirectory $RunRoot -WindowStyle Hidden -PassThru
+Start-Sleep -Seconds 3
+Invoke-WebRequest http://127.0.0.1:18765/api/data-status | Select-Object StatusCode
+Start-Process http://127.0.0.1:18765</pre></div>
+      <p class="expected">PASS: HTTP status is 200 and the dashboard opens without Vite.</p>
+    </div></section>
+
+    <section class="step" id="step-3" data-title="Record identity"><div class="step-head"><span class="num">03</span><h3>Record initial identity</h3><input class="check step-check" type="checkbox" aria-label="Complete step 3"></div><div class="step-body">
+      <div class="code"><button class="copy">Copy</button><pre>$InitialProfile = &amp; $Advisor profile show --profile acceptance --json | ConvertFrom-Json
+$InitialContext = &amp; $Advisor context show --profile acceptance --json | ConvertFrom-Json
+$InitialStatus = Invoke-RestMethod http://127.0.0.1:18765/api/data-status
+$InitialProfile | ConvertTo-Json -Depth 10
+$InitialContext | ConvertTo-Json -Depth 10
+$InitialStatus | ConvertTo-Json -Depth 10</pre></div>
+      <div class="task-list"><label class="task"><input type="checkbox">Record profile and context revisions.</label><label class="task"><input type="checkbox">Confirm schema revision <code>0005</code>.</label><label class="task"><input type="checkbox">Record ruleset hash and active snapshot IDs.</label><label class="task"><input type="checkbox">Confirm dashboard garage matches CLI vehicle statuses.</label></div>
+    </div></section>
+
+    <section class="step" id="step-4" data-title="Garage and draft"><div class="step-head"><span class="num">04</span><h3>Garage mutation and draft retention</h3><input class="check step-check" type="checkbox" aria-label="Complete step 4"></div><div class="step-body">
+      <div class="task-list"><label class="task"><input type="checkbox">Add two vehicles to the unsaved draft.</label><label class="task"><input type="checkbox">Change M3 Lee to <code>owned</code>.</label><label class="task"><input type="checkbox">Confirm recommendations refresh and the draft remains.</label><label class="task"><input type="checkbox">Click Refresh and confirm the draft still remains.</label></div>
+      <div class="code"><button class="copy">Copy</button><pre>&amp; $Advisor profile show --profile acceptance --json | ConvertFrom-Json | Select-Object revision, vehicle_statuses</pre></div>
+      <p class="expected">PASS: M3 Lee is owned in CLI and dashboard; the unsaved draft survives both refreshes.</p>
+    </div></section>
+
+    <section class="step" id="step-5" data-title="Constraints"><div class="step-head"><span class="num">05</span><h3>Constraints and readiness diagnostics</h3><input class="check step-check" type="checkbox" aria-label="Complete step 5"></div><div class="step-body">
+      <div class="task-list"><label class="task"><input type="checkbox">Build a five-vehicle draft.</label><label class="task"><input type="checkbox">Pin two choices and exclude another vehicle.</label><label class="task"><input type="checkbox">Apply constraints and evaluate the draft.</label><label class="task"><input type="checkbox">Inspect readiness and Why/raw-evidence output.</label><label class="task"><input type="checkbox">Create an impossible constraint set.</label></div>
+      <p class="expected">PASS: pins/exclusion are honored; readiness is explained; impossible constraints produce an actionable <code>unsatisfiable_constraints</code> error.</p>
+    </div></section>
+
+    <section class="step" id="step-6" data-title="Comparisons"><div class="step-head"><span class="num">06</span><h3>Same-BR and cross-BR comparisons</h3><input class="check step-check" type="checkbox" aria-label="Complete step 6"></div><div class="step-body">
+      <p>First exercise <strong>Compare draft / play now</strong> in the dashboard, then run:</p>
+      <div class="code"><button class="copy">Copy</button><pre>$SameBr = &amp; $Advisor lineup compare --a "us_m15_cgmc,us_m13_mgmc,us_m3_gmc,us_m3_stuart,us_m2a4" --b "us_m15_cgmc,us_m13_mgmc,us_m3_gmc,us_m3_stuart,us_m2a4_1st" --json | ConvertFrom-Json
+$CrossBr = &amp; $Advisor lineup compare --a "us_m15_cgmc,us_m13_mgmc,us_m3_gmc,us_m3_stuart,us_m2a4" --b "us_m3_lee,us_m15_cgmc,us_m3_gmc,us_m3_stuart,us_m2a4" --json | ConvertFrom-Json
+$SameBr | Select-Object cross_br, overall_delta
+$CrossBr | Select-Object cross_br, overall_delta</pre></div>
+      <p class="expected">PASS: same BR has a numeric overall delta; cross BR has <code>cross_br = true</code> and a null overall delta.</p>
+    </div></section>
+
+    <section class="step" id="step-7" data-title="Preset context"><div class="step-head"><span class="num">07</span><h3>Preset and selected context</h3><input class="check step-check" type="checkbox" aria-label="Complete step 7"></div><div class="step-body">
+      <div class="task-list"><label class="task"><input type="checkbox">Save as “Windows acceptance”.</label><label class="task"><input type="checkbox">Rename to “Windows acceptance renamed”.</label><label class="task"><input type="checkbox">Select it as context, then load it.</label><label class="task"><input type="checkbox">Confirm slots, pins, and exclusions. Do not delete it yet.</label></div>
+      <div class="code"><button class="copy">Copy</button><pre>&amp; $Advisor preset list --profile acceptance --json
+&amp; $Advisor context show --profile acceptance --json</pre></div>
+    </div></section>
+
+    <section class="step" id="step-8" data-title="Hypothetical isolation"><div class="step-head"><span class="num">08</span><h3>Hypothetical ownership isolation</h3><input class="check step-check" type="checkbox" aria-label="Complete step 8"></div><div class="step-body">
+      <div class="code"><button class="copy">Copy</button><pre>$BeforeHypothetical = &amp; $Advisor profile show --profile acceptance --json | ConvertFrom-Json
+&amp; $Advisor lineup generate --profile acceptance --hypothetical-owned us_m4a1 --top 2 --json | Out-Null
+$AfterHypothetical = &amp; $Advisor profile show --profile acceptance --json | ConvertFrom-Json
+[pscustomobject]@{
+  RevisionUnchanged = $BeforeHypothetical.revision -eq $AfterHypothetical.revision
+  GarageUnchanged = (($BeforeHypothetical.vehicle_statuses | ConvertTo-Json -Compress) -eq ($AfterHypothetical.vehicle_statuses | ConvertTo-Json -Compress))
+}</pre></div>
+      <p class="expected">PASS: both values are True.</p>
+    </div></section>
+
+    <section class="step" id="step-9" data-title="Research evidence"><div class="step-head"><span class="num">09</span><h3>Research and data-gap explanations</h3><input class="check step-check" type="checkbox" aria-label="Complete step 9"></div><div class="step-body">
+      <div class="code"><button class="copy">Copy</button><pre>&amp; $Advisor progress next --profile acceptance --json | ConvertFrom-Json | ConvertTo-Json -Depth 20</pre></div>
+      <div class="task-list"><label class="task"><input type="checkbox">Inspect Research Next and Data Health.</label><label class="task"><input type="checkbox">Confirm one-step benefits and prerequisites are visible.</label><label class="task"><input type="checkbox">Confirm unknown evidence remains unknown, not verified absent.</label></div>
+    </div></section>
+
+    <section class="step" id="step-10" data-title="Conflict recovery"><div class="step-head"><span class="num">10</span><h3>Stale-write recovery with two clients</h3><input class="check step-check" type="checkbox" aria-label="Complete step 10"></div><div class="step-body">
+      <p>Refresh the dashboard, then mutate through CLI without refreshing the browser:</p>
+      <div class="code"><button class="copy">Copy</button><pre>$CliSnapshot = &amp; $Advisor profile show --profile acceptance --json | ConvertFrom-Json
+&amp; $Advisor profile set-status us_m3_lee locked --profile acceptance --expected-revision $CliSnapshot.revision --json</pre></div>
+      <div class="task-list"><label class="task"><input type="checkbox">In the stale browser, change M3 Lee to researching.</label><label class="task"><input type="checkbox">Confirm conflict and retained attempted value.</label><label class="task"><input type="checkbox">Click Retry and confirm it saves.</label></div>
+      <div class="code"><button class="copy">Copy</button><pre>(&amp; $Advisor profile show --profile acceptance --json | ConvertFrom-Json).vehicle_statuses.us_m3_lee</pre></div>
+      <p class="expected">PASS: final value is <code>researching</code>.</p>
+    </div></section>
+
+    <section class="step" id="step-11" data-title="Stored staleness"><div class="step-head"><span class="num">11</span><h3>Stored-result staleness</h3><input class="check step-check" type="checkbox" aria-label="Complete step 11"></div><div class="step-body">
+      <div class="code"><button class="copy">Copy</button><pre>$Stored = &amp; $Advisor evaluation create --profile acceptance --top 2 --json | ConvertFrom-Json
+$StoredId = $Stored.evaluation_id
+&amp; $Advisor evaluation show $StoredId --profile acceptance --json | ConvertFrom-Json | Select-Object evaluation_id, stale, stale_reasons
+$Snapshot = &amp; $Advisor profile show --profile acceptance --json | ConvertFrom-Json
+&amp; $Advisor profile set-status us_m3_lee owned --profile acceptance --expected-revision $Snapshot.revision --json | Out-Null
+&amp; $Advisor evaluation show $StoredId --profile acceptance --json | ConvertFrom-Json | Select-Object evaluation_id, stale, stale_reasons</pre></div>
+      <p class="expected">PASS: initially current; afterward stale with <code>profile_garage_state_changed</code>, while stored payload and result ID remain unchanged.</p>
+    </div></section>
+
+    <section class="step" id="step-12" data-title="Process restart"><div class="step-head"><span class="num">12</span><h3>Actual installed-process restart</h3><input class="check step-check" type="checkbox" aria-label="Complete step 12"></div><div class="step-body">
+      <div class="code"><button class="copy">Copy</button><pre>Stop-Process -Id $Dashboard.Id
+$Dashboard.WaitForExit()
+$Dashboard = Start-Process -FilePath $Advisor -ArgumentList @("dashboard", "--port", "18765") -WorkingDirectory $RunRoot -WindowStyle Hidden -PassThru
+Start-Sleep -Seconds 3
+Invoke-WebRequest http://127.0.0.1:18765/api/data-status | Select-Object StatusCode</pre></div>
+      <div class="task-list"><label class="task"><input type="checkbox">Reload the browser.</label><label class="task"><input type="checkbox">Confirm renamed preset and selected context persist.</label><label class="task"><input type="checkbox">Confirm garage states and stored evaluation persist.</label><label class="task"><input type="checkbox">Confirm bundled UI loads without Vite.</label></div>
+      <div class="code"><button class="copy">Copy</button><pre>&amp; $Advisor preset list --profile acceptance --json
+&amp; $Advisor context show --profile acceptance --json
+&amp; $Advisor evaluation show $StoredId --profile acceptance --json</pre></div>
+    </div></section>
+
+    <section class="step" id="step-13" data-title="Record result"><div class="step-head"><span class="num">13</span><h3>Record result and clean up</h3><input class="check step-check" type="checkbox" aria-label="Complete step 13"></div><div class="step-body">
+      <div class="result-grid" id="results"></div>
+      <p><label for="notes">Acceptance notes</label></p><textarea id="notes" placeholder="Record identities, unexpected behavior, screenshots, or follow-up work..."></textarea>
+      <p class="expected warn">Only mark the overall result PASS when every required row passes. This checklist does not involve a running War Thunder game.</p>
+      <div class="code"><button class="copy">Copy</button><pre>Stop-Process -Id $Dashboard.Id
+$Dashboard.WaitForExit()
+Remove-Item Env:\WT_ADVISOR_DB -ErrorAction SilentlyContinue
+Write-Host $RunRoot
+# After saving the report, remove only the exact disposable directory:
+Remove-Item -LiteralPath $RunRoot -Recurse -Force</pre></div>
+    </div></section>
+
+    <section class="final"><p class="kicker">REPORT PREVIEW</p><h3 id="verdict">Windows dashboard acceptance: INCOMPLETE</h3><pre class="final-output" id="report"></pre></section>
+  </main>
+</div>
+<script>
+  const key = "wt-advisor-windows-acceptance-v1";
+  const steps = [...document.querySelectorAll(".step")];
+  const resultNames = ["Installed wheel launch", "Garage matches CLI", "Mutation and draft retention", "Pins / exclusion / readiness", "Unsatisfiable diagnostics", "Same-BR comparison", "Cross-BR null delta", "Preset / context restart", "Hypothetical isolation", "Research / data-gap display", "Conflict / retry recovery", "Stored-result staleness"];
+  const state = JSON.parse(localStorage.getItem(key) || "{}");
+  const nav = document.querySelector("#nav");
+  const results = document.querySelector("#results");
+
+  steps.forEach((step, index) => {
+    nav.insertAdjacentHTML("beforeend", `<a href="#${step.id}">${String(index + 1).padStart(2, "0")} ${step.dataset.title}</a>`);
+    const main = step.querySelector(".step-check");
+    main.checked = Boolean(state.steps?.[index]);
+    step.classList.toggle("done", main.checked);
+    main.addEventListener("change", save);
+    step.querySelectorAll(".task input").forEach((box, taskIndex) => {
+      box.checked = Boolean(state.tasks?.[`${index}-${taskIndex}`]); box.addEventListener("change", save);
+    });
+  });
+  resultNames.forEach((name, index) => results.insertAdjacentHTML("beforeend", `<label>${name}</label><label><input type="radio" name="r${index}" value="PASS"> PASS</label><label><input type="radio" name="r${index}" value="FAIL"> FAIL</label>`));
+  document.querySelectorAll("#results input").forEach((radio) => { radio.checked = state.results?.[radio.name] === radio.value; radio.addEventListener("change", save); });
+  const notes = document.querySelector("#notes"); notes.value = state.notes || ""; notes.addEventListener("input", save);
+
+  function save() {
+    const next = { steps: {}, tasks: {}, results: {}, notes: notes.value };
+    steps.forEach((step, index) => {
+      const checked = step.querySelector(".step-check").checked; next.steps[index] = checked; step.classList.toggle("done", checked);
+      step.querySelectorAll(".task input").forEach((box, taskIndex) => next.tasks[`${index}-${taskIndex}`] = box.checked);
+    });
+    document.querySelectorAll("#results input:checked").forEach((radio) => next.results[radio.name] = radio.value);
+    localStorage.setItem(key, JSON.stringify(next)); update();
+  }
+  function reportText() {
+    const stored = JSON.parse(localStorage.getItem(key) || "{}");
+    const rows = resultNames.map((name, index) => `${name.padEnd(32)} ${stored.results?.[`r${index}`] || "PENDING"}`);
+    const allPass = resultNames.every((_, index) => stored.results?.[`r${index}`] === "PASS");
+    return [`War Thunder Advisor — Windows Dashboard Acceptance`, `Date: ${new Date().toLocaleString()}`, `Overall: ${allPass ? "PASS" : "INCOMPLETE / FAIL"}`, "", ...rows, "", "Notes:", stored.notes || "None"].join("\n");
+  }
+  function update() {
+    const complete = steps.filter(step => step.querySelector(".step-check").checked).length;
+    const pct = Math.round(complete / steps.length * 100);
+    document.querySelector("#meter").style.width = `${pct}%`; document.querySelector("#progress").textContent = `${complete} / ${steps.length} complete`; document.querySelector("#percent").textContent = `${pct}%`;
+    const allPass = resultNames.every((_, index) => document.querySelector(`input[name=r${index}][value=PASS]`).checked);
+    document.querySelector("#verdict").textContent = `Windows dashboard acceptance: ${allPass ? "PASS" : "INCOMPLETE"}`;
+    document.querySelector("#report").textContent = reportText();
+  }
+  document.querySelectorAll(".copy").forEach(button => button.addEventListener("click", async () => { await navigator.clipboard.writeText(button.nextElementSibling.textContent); const old = button.textContent; button.textContent = "Copied"; setTimeout(() => button.textContent = old, 1000); }));
+  document.querySelector("#export").addEventListener("click", () => { const blob = new Blob([reportText()], {type: "text/plain"}); const link = Object.assign(document.createElement("a"), {href: URL.createObjectURL(blob), download: `wt-advisor-windows-acceptance-${new Date().toISOString().slice(0,10)}.txt`}); link.click(); URL.revokeObjectURL(link.href); });
+  document.querySelector("#reset").addEventListener("click", () => { if (confirm("Reset all saved checklist progress and notes?")) { localStorage.removeItem(key); location.reload(); } });
+  const observer = new IntersectionObserver(entries => entries.forEach(entry => { if (entry.isIntersecting) { document.querySelectorAll("nav a").forEach(a => a.classList.toggle("active", a.getAttribute("href") === `#${entry.target.id}`)); } }), {rootMargin: "-20% 0px -70%"}); steps.forEach(step => observer.observe(step));
+  update();
+</script>
+</body>
+</html>

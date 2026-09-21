@@ -6,6 +6,7 @@ from wt_advisor.cli.main import create_app
 from wt_advisor.services.acceptance import (
     build_acceptance_report,
     build_m2_acceptance_report,
+    build_m3_acceptance_report,
     render_acceptance_markdown,
     render_m2_acceptance_markdown,
 )
@@ -50,6 +51,14 @@ def test_m2_acceptance_report_covers_six_quality_scenarios() -> None:
     assert mature["properties"]["m24_vertical_stabilizer_present"] is True
 
 
+def test_m3_acceptance_checks_constrained_generation_and_runtime_schema(tmp_path) -> None:
+    report = build_m3_acceptance_report(AdvisorService.from_database(tmp_path / "advisor.sqlite"))
+
+    assert report["milestone"] == 3
+    assert report["passed"] is True
+    assert all(report["checks"].values())
+
+
 def test_m2_component_freshness_matches_recommendation_evidence_context() -> None:
     report = build_m2_acceptance_report()
     component_names = ("capabilities", "availability", "research_graph")
@@ -83,6 +92,18 @@ def test_cli_selects_m2_acceptance_without_mutating_default_service() -> None:
 
     assert result.exit_code == 0
     assert json.loads(result.stdout)["milestone"] == 2
+
+
+def test_cli_selects_m3_acceptance() -> None:
+    result = CliRunner().invoke(
+        create_app(AdvisorService.from_database("sqlite://")),
+        ["acceptance", "--milestone", "3", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["milestone"] == 3
+    assert payload["passed"] is True
 
 
 def test_cli_rejects_unknown_data_import_source() -> None:

@@ -293,7 +293,7 @@ def test_database_engine_accepts_each_supported_location_shape(tmp_path: Path) -
 def test_database_service_reports_head_schema_revision(tmp_path: Path) -> None:
     service = AdvisorService.from_database(tmp_path / "advisor.sqlite")
 
-    assert service.data_status()["schema_revision"] == "0004"
+    assert service.data_status()["schema_revision"] == "0005"
 
 
 def test_bounded_statistics_reader_rejects_oversized_or_unreadable_files(tmp_path: Path) -> None:
