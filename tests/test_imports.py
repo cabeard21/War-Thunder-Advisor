@@ -233,6 +233,62 @@ def test_statistics_m2_import_maps_identity_and_preserves_reported_ratios() -> N
     assert row.derived_kd == 1.5
 
 
+@pytest.mark.parametrize(
+    "scope", ["air_realistic", "realistic_all_contexts", "unknown_realistic_scope"]
+)
+def test_statistics_import_rejects_non_ground_rb_scope(scope: str) -> None:
+    payload = json.dumps([{"vehicle_id": "us_m24", "mode_scope": scope, "battles": 10}])
+    inspection = inspect_statistics_json(payload, metadata())
+    assert not inspection.valid
+    assert any("mode_scope" in error for error in inspection.errors)
+    with pytest.raises(StatisticsImportError, match="mode_scope"):
+        import_statistics_json(payload, metadata())
+
+
+@pytest.mark.parametrize(
+    ("metric", "value"),
+    [("win_rate", float("nan")), ("kd", float("inf")), ("kills_per_battle", float("-inf"))],
+)
+def test_statistics_import_rejects_nonfinite_metrics(metric: str, value: float) -> None:
+    payload = json.dumps([{
+        "vehicle_id": "us_m24", "mode_scope": "ground_realistic_ground_vehicles", metric: value,
+    }])
+    inspection = inspect_statistics_json(payload, metadata())
+    assert not inspection.valid
+    assert any(metric in error for error in inspection.errors)
+    with pytest.raises(StatisticsImportError, match=metric):
+        import_statistics_json(payload, metadata())
+
+
+@pytest.mark.parametrize(
+    ("metric", "denominator"),
+    [("win_rate", "battles"), ("kd", "deaths"), ("kills_per_battle", "battles")],
+)
+def test_statistics_import_rejects_ratio_with_explicit_zero_denominator(
+    metric: str, denominator: str
+) -> None:
+    payload = json.dumps([{
+        "vehicle_id": "us_m24", "mode_scope": "ground_realistic_ground_vehicles",
+        metric: 0.5, denominator: 0,
+    }])
+    inspection = inspect_statistics_json(payload, metadata())
+    assert not inspection.valid
+    assert any("zero" in error for error in inspection.errors)
+    with pytest.raises(StatisticsImportError, match="zero"):
+        import_statistics_json(payload, metadata())
+
+
+def test_statistics_import_preserves_missing_denominators_without_deriving_counts() -> None:
+    payload = json.dumps([{
+        "vehicle_id": "us_m24", "mode_scope": "ground_realistic_ground_vehicles", "kd": 1.2,
+    }])
+    row = import_statistics_json(payload, metadata()).records[0]
+    assert row.battles is None
+    assert row.deaths is None
+    assert row.reported_kd == 1.2
+    assert row.derived_kd is None
+
+
 def test_capability_import_preserves_explicit_false_and_rejects_missing_value() -> None:
     cap_metadata = metadata(DatasetType.CAPABILITIES)
     payload = json.dumps(
@@ -253,6 +309,56 @@ def test_capability_import_preserves_explicit_false_and_rejects_missing_value() 
     assert dataset.resolve("us_m24", "scouting").state is CapabilityState.VERIFIED_ABSENT
     with pytest.raises(ValueError, match="value"):
         import_capabilities_json(payload.replace(', "value": false', ""), cap_metadata)
+
+
+def test_capability_import_rejects_duplicate_claims() -> None:
+    cap_metadata = metadata(DatasetType.CAPABILITIES)
+    row = {
+        "vehicle_id": "us_m24",
+        "capability": "scouting",
+        "value": True,
+        "source_provider": "curated",
+        "source_reference": "reference",
+        "source_type": "curated_import",
+        "verified_at": "2026-09-21",
+        "source_revision": "manual-r1",
+    }
+    with pytest.raises(ValueError, match="duplicate observations"):
+        import_capabilities_json(json.dumps([row, row]), cap_metadata)
+
+
+def test_capability_import_rejects_overridden_snapshot_identity() -> None:
+    row = {
+        "vehicle_id": "us_m24",
+        "capability": "scouting",
+        "value": True,
+        "source_provider": "curated",
+        "source_snapshot_id": "forged-snapshot",
+        "source_reference": "reference",
+        "source_type": "curated_import",
+    }
+    with pytest.raises(ValueError, match="source_snapshot_id"):
+        import_capabilities_json(json.dumps([row]), metadata(DatasetType.CAPABILITIES))
+
+
+def test_curated_capability_import_requires_per_claim_verification() -> None:
+    row = {
+        "vehicle_id": "us_m24",
+        "capability": "scouting",
+        "value": True,
+        "source_provider": "curated",
+        "source_reference": "https://example.invalid/vehicle",
+        "source_type": "curated_import",
+    }
+    with pytest.raises(ValueError, match="verified_at"):
+        import_capabilities_json(json.dumps([row]), metadata(DatasetType.CAPABILITIES))
+    row["verified_at"] = "2026-09-21"
+    with pytest.raises(ValueError, match="source_revision"):
+        import_capabilities_json(json.dumps([row]), metadata(DatasetType.CAPABILITIES))
+    row["source_revision"] = "wiki-2026-09-21"
+    assert import_capabilities_json(
+        json.dumps([row]), metadata(DatasetType.CAPABILITIES)
+    ).records[0].verified_at == date(2026, 9, 21)
 
 
 def test_availability_yaml_import_is_strict_and_provenance_stamped() -> None:

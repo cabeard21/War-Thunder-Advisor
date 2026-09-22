@@ -8,6 +8,7 @@ import pytest
 from alembic import command
 from sqlalchemy import Engine, func, inspect, select
 
+from wt_advisor.data.models import RawCapabilityDataset
 from wt_advisor.data.providers.fixture import FixtureProvider
 from wt_advisor.domain.models import (
     Capability,
@@ -22,7 +23,13 @@ from wt_advisor.domain.models import (
     VehicleClass,
     VehicleStatus,
 )
-from wt_advisor.storage.db import _alembic_config, build_engine, create_database
+from wt_advisor.storage.db import (
+    _alembic_config,
+    _upgrade_packaged_0005_to_0006,
+    _upgrade_packaged_0006_to_0007,
+    build_engine,
+    create_database,
+)
 from wt_advisor.storage.models import (
     CapabilityObservationRow,
     DataSnapshotRow,
@@ -68,6 +75,36 @@ def m3_lee(*, name: str = "M3 Lee") -> Vehicle:
         purchase_cost=55_000,
         capabilities=frozenset({Capability.ARTILLERY, Capability.SMOKE}),
     )
+
+
+def test_operational_bundle_rolls_back_when_component_is_invalid(tmp_path: Path) -> None:
+    engine = create_database(tmp_path / "atomic.sqlite")
+    repository = EvidenceRepository(engine)
+    fixture = FixtureProvider().load()
+    bad_capabilities = RawCapabilityDataset(
+        snapshot=snapshot("bad-capabilities", DatasetType.CAPABILITIES, b"[]"),
+        records=(),
+        raw_content=b"wrong checksum",
+    )
+
+    with pytest.raises(ValueError, match="checksum"):
+        repository.import_operational_bundle(
+            vehicles=fixture.vehicles, capabilities=bad_capabilities
+        )
+
+    with repository.session() as session:
+        assert session.scalar(select(func.count()).select_from(DataSnapshotRow)) == 0
+
+
+def test_raw_artifact_content_reads_retained_snapshot_bytes(tmp_path: Path) -> None:
+    repository = EvidenceRepository(create_database(tmp_path / "artifact.sqlite"))
+    fixture = FixtureProvider().load()
+    repository.import_vehicle_dataset(fixture.vehicles)
+
+    assert repository.raw_artifact_content(fixture.vehicles.snapshot.snapshot_id) == (
+        fixture.vehicles.raw_content
+    )
+    assert repository.raw_artifact_content("missing") is None
 
 
 def test_create_database_runs_baseline_migration(tmp_path: Path) -> None:
@@ -365,6 +402,138 @@ def test_capability_observations_preserve_negative_unknown_and_conflict(
     engine.dispose()
 
 
+def test_capability_import_rejects_duplicate_claims_and_rolls_back(
+    database: tuple[Engine, EvidenceRepository],
+) -> None:
+    engine, repository = database
+    repository.import_vehicle_snapshot(
+        snapshot("vehicles-r1", DatasetType.VEHICLE_METADATA, b"vehicles"),
+        [m3_lee()],
+        raw_content=b"vehicles",
+    )
+    item = {
+        "vehicle_id": "us_m3_lee",
+        "capability": "scouting",
+        "value": True,
+        "source_reference": "reference",
+    }
+    with pytest.raises(ValueError, match="duplicate capability observation"):
+        repository.import_capability_snapshot(
+            snapshot("capabilities-duplicate", DatasetType.CAPABILITIES, b"duplicate"),
+            [item, item],
+            raw_content=b"duplicate",
+        )
+    assert repository.get_snapshot("capabilities-duplicate") is None
+    engine.dispose()
+
+
+def test_capability_import_rejects_non_boolean_and_unknown_vehicle(
+    database: tuple[Engine, EvidenceRepository],
+) -> None:
+    engine, repository = database
+    repository.import_vehicle_snapshot(
+        snapshot("vehicles-r1", DatasetType.VEHICLE_METADATA, b"vehicles"),
+        [m3_lee()],
+        raw_content=b"vehicles",
+    )
+    for vehicle_id, value, expected in (
+        ("us_m3_lee", "false", "boolean"),
+        ("unknown_vehicle", False, "unknown vehicle"),
+    ):
+        with pytest.raises(ValueError, match=expected):
+            repository.import_capability_snapshot(
+                snapshot(f"bad-{vehicle_id}", DatasetType.CAPABILITIES, b"bad"),
+                [{
+                    "vehicle_id": vehicle_id,
+                    "capability": "scouting",
+                    "value": value,
+                    "source_reference": "reference",
+                }],
+                raw_content=b"bad",
+            )
+    engine.dispose()
+
+
+def test_capability_revisions_keep_distinct_claims_and_supersede_same_claim(
+    database: tuple[Engine, EvidenceRepository],
+) -> None:
+    engine, repository = database
+    vehicle_snapshot = snapshot("vehicles-r1", DatasetType.VEHICLE_METADATA, b"vehicles")
+    repository.import_vehicle_snapshot(vehicle_snapshot, [m3_lee()], raw_content=b"vehicles")
+    revisions = (
+        ("api-r0", b"api0", True, "api:scouting", "community_api"),
+        ("api-r1", b"api1", False, "api:scouting", "community_api"),
+        ("curated-r1", b"curated1", False, "manual:scouting", "curated_import"),
+        ("curated-r2", b"curated2", True, "manual:scouting", "curated_import"),
+    )
+    for snapshot_id, content, value, reference, source_type in revisions:
+        repository.import_capability_snapshot(
+            snapshot(snapshot_id, DatasetType.CAPABILITIES, content),
+            [{
+                "vehicle_id": "us_m3_lee",
+                "capability": "scouting",
+                "value": value,
+                "source_provider": "curated" if source_type == "curated_import" else "api",
+                "source_type": source_type,
+                "source_reference": reference,
+                "verified_at": "2026-09-18",
+                "source_revision": snapshot_id,
+            }],
+            raw_content=content,
+        )
+    selected = repository.list_compatible_capability_snapshots(vehicle_snapshot)
+    assert "api-r0" not in {item.snapshot_id for item in selected}
+    resolution = repository.resolve_capabilities(
+        "us_m3_lee", snapshot_ids=tuple(item.snapshot_id for item in selected)
+    )[Capability.SCOUTING]
+    assert resolution.state == "conflicted"
+    assert {item.source_snapshot_id for item in resolution.observations} == {
+        "api-r1", "curated-r2"
+    }
+    assert (
+        next(item for item in resolution.observations if item.value).source_revision
+        == "curated-r2"
+    )
+    engine.dispose()
+
+
+def test_capability_resolution_uses_verification_date_and_separates_source_types(
+    database: tuple[Engine, EvidenceRepository],
+) -> None:
+    engine, repository = database
+    vehicle_snapshot = snapshot("vehicles-r1", DatasetType.VEHICLE_METADATA, b"vehicles")
+    repository.import_vehicle_snapshot(vehicle_snapshot, [m3_lee()], raw_content=b"vehicles")
+    claims = (
+        ("api", True, "community_api", None, 18),
+        ("curated-new", False, "curated_import", "2026-09-20", 19),
+        ("curated-old-late", True, "curated_import", "2025-09-20", 21),
+    )
+    for snapshot_id, value, source_type, verified_at, day in claims:
+        evidence = snapshot(
+            snapshot_id, DatasetType.CAPABILITIES, snapshot_id.encode()
+        ).model_copy(update={"retrieved_at": datetime(2026, 9, day, tzinfo=UTC)})
+        repository.import_capability_snapshot(
+            evidence,
+            [{
+                "vehicle_id": "us_m3_lee", "capability": "scouting", "value": value,
+                "source_provider": "shared-provider", "source_reference": "shared:reference",
+                "source_type": source_type, "verified_at": verified_at,
+                "source_revision": snapshot_id,
+            }],
+            raw_content=snapshot_id.encode(),
+        )
+    selected = repository.list_compatible_capability_snapshots(vehicle_snapshot)
+    resolved = repository.resolve_capabilities(
+        "us_m3_lee", snapshot_ids=tuple(item.snapshot_id for item in selected)
+    )[Capability.SCOUTING]
+
+    assert resolved.state == "conflicted"
+    assert {row.source_snapshot_id for row in resolved.observations} == {
+        "api", "curated-new",
+    }
+    engine.dispose()
+
+
 def test_independent_evidence_imports_validate_identity_and_preserve_graph_semantics(
     database: tuple[Engine, EvidenceRepository],
 ) -> None:
@@ -551,6 +720,7 @@ def test_statistics_store_reported_ratios_and_import_diagnostics(
                 "reported_kd": 1.5,
                 "reported_kills_per_battle": 1.5,
                 "ratio_provenance": "provider_reported",
+                "kill_target_definition": "ground_targets",
             }
         ],
         raw_content=b"stats",
@@ -566,8 +736,48 @@ def test_statistics_store_reported_ratios_and_import_diagnostics(
     diagnostics = repository.get_statistics_import_diagnostics("stats-r1")
 
     assert stored.reported_kd == 1.5
-    assert stored.reported_kd == 1.5
+    assert stored.kill_target_definition.value == "ground_targets"
     assert diagnostics is not None and diagnostics.matched_count == 1
+    engine.dispose()
+
+
+def test_statistics_normalization_revision_creates_distinct_idempotent_snapshot(
+    database: tuple[Engine, EvidenceRepository],
+) -> None:
+    engine, repository = database
+    repository.import_vehicle_snapshot(
+        snapshot("vehicles-r1", DatasetType.VEHICLE_METADATA, b"vehicles"),
+        [m3_lee()],
+        raw_content=b"vehicles",
+    )
+    old = snapshot("stats-old", DatasetType.GLOBAL_STATISTICS, b"same-source")
+    revised = snapshot("stats-v2", DatasetType.GLOBAL_STATISTICS, b"same-source")
+    records = [{"vehicle_id": "us_m3_lee", "mode_scope": "ground_realistic_ground_vehicles"}]
+
+    assert repository.import_statistics_snapshot(old, records, raw_content=b"same-source").created
+    first = repository.import_statistics_snapshot(
+        revised, records, raw_content=b"same-source", provider_version="ground-targets-v2"
+    )
+    repeated = repository.import_statistics_snapshot(
+        revised, records, raw_content=b"same-source", provider_version="ground-targets-v2"
+    )
+
+    assert first.created is True
+    assert first.snapshot_id == "stats-v2"
+    assert repeated.created is False
+    assert repeated.snapshot_id == "stats-v2"
+    with repository.session() as session:
+        rows = tuple(
+            session.scalars(
+                select(DataSnapshotRow).where(
+                    DataSnapshotRow.dataset_type == DatasetType.GLOBAL_STATISTICS.value
+                )
+            )
+        )
+        assert len(rows) == 2
+        assert {row.provider_version for row in rows} == {None, "ground-targets-v2"}
+        assert {row.source_revision for row in rows} == {"r1"}
+        assert len({row.checksum for row in rows}) == 1
     engine.dispose()
 
 
@@ -644,7 +854,7 @@ def database(tmp_path: Path) -> tuple[Engine, EvidenceRepository]:
     return engine, EvidenceRepository(engine)
 
 
-def test_populated_0004_upgrades_to_0005_without_losing_profile(tmp_path: Path) -> None:
+def test_populated_0004_upgrades_to_0007_without_losing_profile(tmp_path: Path) -> None:
     database_path = tmp_path / "legacy.sqlite"
     engine = build_engine(database_path)
     command.upgrade(_alembic_config(engine), "0004")
@@ -661,4 +871,100 @@ def test_populated_0004_upgrades_to_0005_without_losing_profile(tmp_path: Path) 
     repository = EvidenceRepository(engine)
     assert repository.get_profile("legacy") is not None
     assert inspect(engine).has_table("stored_evaluations")
+    with engine.connect() as connection:
+        revision = connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar()
+        assert revision == "0007"
+    engine.dispose()
+
+
+def test_packaged_0005_upgrade_preserves_observations_and_reaches_0006(
+    tmp_path: Path,
+) -> None:
+    engine = build_engine(tmp_path / "packaged.sqlite")
+    command.upgrade(_alembic_config(engine), "0005")
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO data_snapshots "
+            "(snapshot_id, dataset_type, provider, retrieved_at, checksum, freshness, purpose) "
+            "VALUES ('caps-old', 'capabilities', 'test', '2026-09-01', "
+            "'checksum', 'fresh', 'operational')"
+        )
+        connection.exec_driver_sql("INSERT INTO vehicles (vehicle_id) VALUES ('us_m3_lee')")
+        connection.exec_driver_sql(
+            "INSERT INTO capability_observations "
+            "(snapshot_id, vehicle_id, capability, value, source_provider, source_type, "
+            "source_reference, confidence) VALUES "
+            "('caps-old', 'us_m3_lee', 'scouting', 1, 'test', 'curated_import', 'ref', 1.0)"
+        )
+        _upgrade_packaged_0005_to_0006(connection)
+        assert (
+            connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar()
+            == "0006"
+        )
+        assert connection.exec_driver_sql(
+            "SELECT value, verified_at, source_revision FROM capability_observations"
+        ).one() == (1, None, None)
+    engine.dispose()
+
+
+def test_packaged_0006_upgrade_preserves_existing_statistics_definition(
+    tmp_path: Path,
+) -> None:
+    engine = build_engine(tmp_path / "packaged-metrics.sqlite")
+    command.upgrade(_alembic_config(engine), "0006")
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO data_snapshots "
+            "(snapshot_id, dataset_type, provider, retrieved_at, source_revision, checksum, "
+            "freshness, purpose) VALUES "
+            "('stats-old', 'global_statistics', 'fixture', '2026-09-01', 'r1', "
+            "'checksum', 'fresh', 'operational')"
+        )
+        connection.exec_driver_sql("INSERT INTO vehicles (vehicle_id) VALUES ('us_m3_lee')")
+        connection.exec_driver_sql(
+            "INSERT INTO vehicle_statistics (snapshot_id, vehicle_id, mode_scope, reported_kd) "
+            "VALUES ('stats-old', 'us_m3_lee', 'ground_realistic_ground_vehicles', 1.5)"
+        )
+    with engine.begin() as connection:
+        _upgrade_packaged_0006_to_0007(connection)
+        assert connection.exec_driver_sql(
+            "SELECT version_num FROM alembic_version"
+        ).scalar() == "0007"
+        assert connection.exec_driver_sql(
+            "SELECT kill_target_definition, reported_kd FROM vehicle_statistics"
+        ).one() == ("all_targets", 1.5)
+        assert connection.exec_driver_sql(
+            "SELECT checksum, source_revision, provider_version FROM data_snapshots"
+        ).one() == ("checksum", "r1", None)
+        assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
+    with engine.connect() as connection:
+        assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+    engine.dispose()
+
+
+def test_alembic_0006_upgrade_preserves_populated_snapshot_references(
+    tmp_path: Path,
+) -> None:
+    engine = build_engine(tmp_path / "alembic-metrics.sqlite")
+    command.upgrade(_alembic_config(engine), "0006")
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO data_snapshots "
+            "(snapshot_id, dataset_type, provider, retrieved_at, source_revision, checksum, "
+            "freshness, purpose) VALUES "
+            "('stats-old', 'global_statistics', 'fixture', '2026-09-01', 'r1', "
+            "'checksum', 'fresh', 'operational')"
+        )
+        connection.exec_driver_sql("INSERT INTO vehicles (vehicle_id) VALUES ('us_m3_lee')")
+        connection.exec_driver_sql(
+            "INSERT INTO vehicle_statistics (snapshot_id, vehicle_id, mode_scope, reported_kd) "
+            "VALUES ('stats-old', 'us_m3_lee', 'ground_realistic_ground_vehicles', 1.5)"
+        )
+    command.upgrade(_alembic_config(engine), "head")
+    with engine.connect() as connection:
+        assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+        assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
+        assert connection.exec_driver_sql(
+            "SELECT kill_target_definition FROM vehicle_statistics"
+        ).scalar() == "all_targets"
     engine.dispose()

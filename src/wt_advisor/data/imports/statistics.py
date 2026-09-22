@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from collections.abc import Collection, Mapping
 from datetime import date
 from hashlib import sha256
@@ -180,13 +181,32 @@ def _inspection(
     for index, row in enumerate(records):
         try:
             if row.get("mode_scope") is not None:
-                scopes.add(StatisticsScope(str(row["mode_scope"])))
+                scope = StatisticsScope(str(row["mode_scope"]))
+                scopes.add(scope)
+                if scope is not StatisticsScope.GROUND_REALISTIC_GROUND_VEHICLES:
+                    errors.append(f"record {index} mode_scope is not Ground RB ground vehicles")
+            else:
+                errors.append(f"record {index} mode_scope is missing")
             if row.get("sample_start") is not None:
                 starts.append(date.fromisoformat(str(row["sample_start"])))
             if row.get("sample_end") is not None:
                 ends.append(date.fromisoformat(str(row["sample_end"])))
         except ValueError as exc:
             errors.append(f"record {index} contains invalid scope or date: {exc}")
+        for metric in METRIC_COLUMNS:
+            value = row.get(metric)
+            if isinstance(value, bool) or (
+                value is not None
+                and (not isinstance(value, (int, float)) or not math.isfinite(value))
+            ):
+                errors.append(f"record {index} {metric} must be a finite number")
+        for ratio, denominator in (
+            ("win_rate", "battles"),
+            ("kd", "deaths"),
+            ("kills_per_battle", "battles"),
+        ):
+            if row.get(ratio) is not None and row.get(denominator) == 0:
+                errors.append(f"record {index} {ratio} has explicit zero {denominator} denominator")
 
     total = len(records)
     coverage = {

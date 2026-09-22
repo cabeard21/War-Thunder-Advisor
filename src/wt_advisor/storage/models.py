@@ -38,6 +38,7 @@ class DataSnapshotRow(Base):
             "provider",
             "source_revision",
             "checksum",
+            "provider_version",
             name="uq_snapshot_source_content",
         ),
     )
@@ -178,6 +179,9 @@ class VehicleStatisticsRow(Base):
     reported_kd: Mapped[float | None] = mapped_column(Float)
     reported_kills_per_battle: Mapped[float | None] = mapped_column(Float)
     ratio_provenance: Mapped[str | None] = mapped_column(String(60))
+    kill_target_definition: Mapped[str] = mapped_column(
+        String(40), nullable=False, default="all_targets"
+    )
 
 
 class CapabilityObservationRow(Base):
@@ -205,6 +209,8 @@ class CapabilityObservationRow(Base):
     source_type: Mapped[str] = mapped_column(String(60), nullable=False)
     source_reference: Mapped[str] = mapped_column(Text, nullable=False)
     confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    verified_at: Mapped[date | None] = mapped_column(Date)
+    source_revision: Mapped[str | None] = mapped_column(String(160))
 
 
 class AvailabilityObservationRow(Base):

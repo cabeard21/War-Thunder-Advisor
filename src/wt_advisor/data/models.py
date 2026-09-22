@@ -94,6 +94,7 @@ class RawStatisticsDataset(FrozenModel):
     snapshot: SnapshotRef
     records: tuple[VehicleStatistics, ...]
     raw_content: bytes = Field(repr=False)
+    normalization_revision: str | None = None
 
 
 class RawCapabilityDataset(FrozenModel):
@@ -104,7 +105,7 @@ class RawCapabilityDataset(FrozenModel):
     @model_validator(mode="after")
     def unique_observations(self) -> RawCapabilityDataset:
         keys = [
-            (row.vehicle_id, row.capability, row.source_provider, row.source_reference)
+            (row.vehicle_id, row.capability, row.source_reference)
             for row in self.records
         ]
         if len(keys) != len(set(keys)):

@@ -170,6 +170,11 @@ class RatioProvenance(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
+class KillTargetDefinition(StrEnum):
+    ALL_TARGETS = "all_targets"
+    GROUND_TARGETS = "ground_targets"
+
+
 class ResearchDomain(StrEnum):
     GROUND = "ground"
 
@@ -225,12 +230,14 @@ class Vehicle(FrozenModel):
 class CapabilityObservation(FrozenModel):
     vehicle_id: str = Field(min_length=1, pattern=r"^[a-z0-9_]+$")
     capability: Capability
-    value: bool
+    value: bool = Field(strict=True)
     source_provider: str = Field(min_length=1)
     source_snapshot_id: str = Field(min_length=1)
     source_reference: str = Field(min_length=1)
     source_type: CapabilitySourceType
     confidence: float | None = Field(default=None, ge=0, le=1)
+    verified_at: date | None = None
+    source_revision: str | None = None
 
 
 class CapabilityResolution(FrozenModel):
@@ -355,6 +362,7 @@ class VehicleStatistics(FrozenModel):
     reported_kd: float | None = Field(default=None, ge=0)
     reported_kills_per_battle: float | None = Field(default=None, ge=0)
     ratio_provenance: RatioProvenance | None = None
+    kill_target_definition: KillTargetDefinition = KillTargetDefinition.ALL_TARGETS
 
     @model_validator(mode="after")
     def consistent_observation(self) -> VehicleStatistics:

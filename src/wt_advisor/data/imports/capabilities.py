@@ -30,6 +30,14 @@ def import_capabilities_json(
         raise ValueError("capability JSON must be an array of objects")
     if len(decoded) > MAX_CAPABILITY_IMPORT_ROWS:
         raise ValueError("capability import exceeds configured row limit")
+    if any("source_snapshot_id" in row for row in decoded):
+        raise ValueError("source_snapshot_id is assigned by import metadata")
+    for row in decoded:
+        if row.get("source_type") == "curated_import":
+            if not row.get("verified_at"):
+                raise ValueError("curated capability observation requires verified_at")
+            if not row.get("source_revision"):
+                raise ValueError("curated capability observation requires source_revision")
     try:
         records = tuple(
             CapabilityObservation.model_validate(

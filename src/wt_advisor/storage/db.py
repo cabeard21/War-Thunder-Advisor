@@ -9,8 +9,10 @@ from typing import cast
 
 from alembic import command
 from alembic.config import Config
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from alembic.util.exc import CommandError
-from sqlalchemy import Engine, Table, create_engine, event, inspect, text
+from sqlalchemy import Column, Engine, String, Table, create_engine, event, inspect, text
 from sqlalchemy.engine import URL, Connection
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -19,6 +21,12 @@ def _enable_sqlite_foreign_keys(dbapi_connection: object, _: object) -> None:
     cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
+
+
+def _restore_sqlite_foreign_keys_on_checkout(
+    dbapi_connection: object, _: object, __: object
+) -> None:
+    _enable_sqlite_foreign_keys(dbapi_connection, None)
 
 
 def build_engine(database: str | Path | URL = "wt-advisor.sqlite") -> Engine:
@@ -37,6 +45,9 @@ def build_engine(database: str | Path | URL = "wt-advisor.sqlite") -> Engine:
         url = f"sqlite:///{path.resolve().as_posix()}"
     engine = create_engine(url, future=True)
     event.listen(engine, "connect", _enable_sqlite_foreign_keys)
+    # SQLite migrations may temporarily disable FK checks while rebuilding a
+    # referenced table; restore the invariant before reusing pooled connections.
+    event.listen(engine, "checkout", _restore_sqlite_foreign_keys_on_checkout)
     return engine
 
 
@@ -68,17 +79,26 @@ def create_database(database: str | Path | URL = "wt-advisor.sqlite") -> Engine:
                 version = connection.execute(
                     text("SELECT version_num FROM alembic_version")
                 ).scalar()
+                if version == "0007":
+                    return engine
+                if version == "0006":
+                    _upgrade_packaged_0006_to_0007(connection)
+                    return engine
                 if version == "0005":
+                    _upgrade_packaged_0005_to_0006(connection)
+                    _upgrade_packaged_0006_to_0007(connection)
                     return engine
                 if version == "0004":
                     _upgrade_packaged_0004_to_0005(connection)
+                    _upgrade_packaged_0005_to_0006(connection)
+                    _upgrade_packaged_0006_to_0007(connection)
                     return engine
                 raise
             Base.metadata.create_all(connection)
             connection.execute(
                 text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
             )
-            connection.execute(text("INSERT INTO alembic_version (version_num) VALUES ('0005')"))
+            connection.execute(text("INSERT INTO alembic_version (version_num) VALUES ('0007')"))
     return engine
 
 
@@ -108,8 +128,51 @@ def _upgrade_packaged_0004_to_0005(connection: Connection) -> None:
     )
 
 
+def _upgrade_packaged_0005_to_0006(connection: Connection) -> None:
+    """Apply the capability-provenance delta in an installed wheel."""
+
+    columns = {
+        column["name"] for column in inspect(connection).get_columns("capability_observations")
+    }
+    if "verified_at" not in columns:
+        connection.execute(text("ALTER TABLE capability_observations ADD COLUMN verified_at DATE"))
+    if "source_revision" not in columns:
+        connection.execute(
+            text("ALTER TABLE capability_observations ADD COLUMN source_revision VARCHAR(160)")
+        )
+    connection.execute(
+        text("UPDATE alembic_version SET version_num = '0006' WHERE version_num = '0005'")
+    )
+
+
+def _upgrade_packaged_0006_to_0007(connection: Connection) -> None:
+    """Apply metric-identity storage delta when migration scripts are absent."""
+
+    operations = Operations(MigrationContext.configure(connection))
+    connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+    operations.add_column(
+        "vehicle_statistics",
+        Column(
+            "kill_target_definition",
+            String(40),
+            nullable=False,
+            server_default="all_targets",
+        ),
+    )
+    with operations.batch_alter_table("data_snapshots") as batch:
+        batch.drop_constraint("uq_snapshot_source_content", type_="unique")
+        batch.create_unique_constraint(
+            "uq_snapshot_source_content",
+            ["dataset_type", "provider", "source_revision", "checksum", "provider_version"],
+        )
+    connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+    connection.execute(
+        text("UPDATE alembic_version SET version_num = '0007' WHERE version_num = '0006'")
+    )
+
+
 @contextmanager
-def database_session(engine: Engine) -> Iterator[Session]:
+def database_session(engine: Engine | Connection) -> Iterator[Session]:
     """Provide a transaction-scoped SQLAlchemy session."""
 
     factory = sessionmaker(bind=engine, expire_on_commit=False)

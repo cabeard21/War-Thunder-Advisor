@@ -7,11 +7,18 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from hashlib import sha256
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from sqlalchemy import Engine, select, update
 from sqlalchemy.orm import Session
 
+from wt_advisor.data.models import (
+    RawAvailabilityDataset,
+    RawCapabilityDataset,
+    RawResearchGraphDataset,
+    RawStatisticsDataset,
+    RawVehicleDataset,
+)
 from wt_advisor.domain.models import (
     BR_LADDER,
     AcquisitionType,
@@ -23,6 +30,7 @@ from wt_advisor.domain.models import (
     DatasetType,
     Freshness,
     GameMode,
+    KillTargetDefinition,
     Nation,
     PrerequisiteSemantics,
     ReconciliationItem,
@@ -251,6 +259,9 @@ class StatisticsDataset(Protocol):
     @property
     def raw_content(self) -> bytes: ...
 
+    @property
+    def normalization_revision(self) -> str | None: ...
+
 
 def _mapping(value: Mapping[str, Any] | object) -> dict[str, Any]:
     if isinstance(value, Mapping):
@@ -300,6 +311,49 @@ class EvidenceRepository:
         with database_session(self.engine) as session:
             yield session
 
+    def raw_artifact_content(self, snapshot_id: str) -> bytes | None:
+        """Return retained source bytes for a known immutable snapshot."""
+
+        with self.session() as session:
+            artifact = session.scalar(
+                select(RawArtifactRow).where(RawArtifactRow.snapshot_id == snapshot_id)
+            )
+            return None if artifact is None else bytes(artifact.content)
+
+    def import_operational_bundle(
+        self,
+        *,
+        vehicles: RawVehicleDataset,
+        capabilities: RawCapabilityDataset,
+        availability: RawAvailabilityDataset | None = None,
+        research_graph: RawResearchGraphDataset | None = None,
+        statistics: RawStatisticsDataset | None = None,
+    ) -> None:
+        """Publish related evidence in one database transaction or none at all."""
+
+        with self.engine.begin() as connection:
+            transactional = EvidenceRepository(cast(Engine, connection))
+            transactional.import_vehicle_dataset(vehicles)
+            transactional.import_capability_snapshot(
+                capabilities.snapshot,
+                capabilities.records,
+                raw_content=capabilities.raw_content,
+            )
+            if availability is not None:
+                transactional.import_availability_snapshot(
+                    availability.snapshot,
+                    availability.records,
+                    raw_content=availability.raw_content,
+                )
+            if research_graph is not None:
+                transactional.import_research_graph_snapshot(
+                    research_graph.snapshot,
+                    research_graph.records,
+                    raw_content=research_graph.raw_content,
+                )
+            if statistics is not None:
+                transactional.import_statistics_dataset(statistics)
+
     def _add_snapshot(
         self,
         session: Session,
@@ -316,6 +370,7 @@ class EvidenceRepository:
                 DataSnapshotRow.provider == snapshot.provider,
                 DataSnapshotRow.source_revision == snapshot.source_revision,
                 DataSnapshotRow.checksum == snapshot.checksum,
+                DataSnapshotRow.provider_version == provider_version,
             )
         )
         if same_identity is not None:
@@ -541,7 +596,22 @@ class EvidenceRepository:
         provider_version: str | None = None,
         notes: str | None = None,
     ) -> ImportResult:
-        normalized = tuple(_mapping(item) for item in observations)
+        normalized = tuple(
+            CapabilityObservation.model_validate(
+                {
+                    **_mapping(item),
+                    "source_provider": _mapping(item).get("source_provider", snapshot.provider),
+                    "source_snapshot_id": snapshot.snapshot_id,
+                    "source_type": _mapping(item).get(
+                        "source_type", CapabilitySourceType.CURATED_IMPORT
+                    ),
+                }
+            )
+            for item in observations
+        )
+        keys = [(item.vehicle_id, item.capability, item.source_reference) for item in normalized]
+        if len(keys) != len(set(keys)):
+            raise ValueError("duplicate capability observation")
         with self.session() as session:
             result = self._begin_component_import(
                 session,
@@ -556,34 +626,56 @@ class EvidenceRepository:
                 return result
             known_ids = self._known_vehicle_ids(session)
             for item in normalized:
-                vehicle_id = str(item["vehicle_id"])
+                vehicle_id = item.vehicle_id
                 self._validate_known_vehicle(known_ids, vehicle_id)
-                confidence = item.get("confidence")
                 session.add(
                     CapabilityObservationRow(
                         snapshot_id=snapshot.snapshot_id,
                         vehicle_id=vehicle_id,
-                        capability=_enum_value(item["capability"]),
-                        value=bool(item["value"]),
-                        source_provider=str(item.get("source_provider", snapshot.provider)),
-                        source_type=_enum_value(
-                            item.get("source_type", CapabilitySourceType.CURATED_IMPORT)
-                        ),
-                        source_reference=str(item["source_reference"]),
-                        confidence=1.0 if confidence is None else float(confidence),
+                        capability=item.capability.value,
+                        value=item.value,
+                        source_provider=item.source_provider,
+                        source_type=item.source_type.value,
+                        source_reference=item.source_reference,
+                        confidence=1.0 if item.confidence is None else item.confidence,
+                        verified_at=item.verified_at,
+                        source_revision=item.source_revision,
                     )
                 )
             return result
 
     def resolve_capabilities(
-        self, vehicle_id: str, *, snapshot_id: str
+        self,
+        vehicle_id: str,
+        *,
+        snapshot_id: str | None = None,
+        snapshot_ids: Sequence[str] | None = None,
     ) -> dict[Capability, CapabilityResolution]:
+        if (snapshot_id is None) == (snapshot_ids is None):
+            raise ValueError("provide exactly one of snapshot_id or snapshot_ids")
+        selected_ids = (snapshot_id,) if snapshot_id is not None else tuple(snapshot_ids or ())
+        if not selected_ids:
+            return {}
+        if len(selected_ids) != len(set(selected_ids)):
+            raise ValueError("duplicate capability snapshot ID")
         with self.session() as session:
+            snapshot_rows = tuple(
+                session.scalars(
+                    select(DataSnapshotRow).where(DataSnapshotRow.snapshot_id.in_(selected_ids))
+                )
+            )
+            if len(snapshot_rows) != len(selected_ids) or any(
+                row.dataset_type != DatasetType.CAPABILITIES.value for row in snapshot_rows
+            ):
+                raise ValueError("unknown or non-capability snapshot ID")
+            chronology = {
+                row.snapshot_id: (row.retrieved_at, row.snapshot_id) for row in snapshot_rows
+            }
             rows = tuple(
                 session.scalars(
                     select(CapabilityObservationRow)
                     .where(
-                        CapabilityObservationRow.snapshot_id == snapshot_id,
+                        CapabilityObservationRow.snapshot_id.in_(selected_ids),
                         CapabilityObservationRow.vehicle_id == vehicle_id,
                     )
                     .order_by(
@@ -592,8 +684,33 @@ class EvidenceRepository:
                     )
                 )
             )
-        grouped: dict[Capability, list[CapabilityObservation]] = {}
+        latest_claims: dict[tuple[str, str, str, str], CapabilityObservationRow] = {}
         for row in rows:
+            claim = (
+                row.capability, row.source_provider, row.source_reference, row.source_type
+            )
+            previous = latest_claims.get(claim)
+            priority = (
+                row.verified_at or chronology[row.snapshot_id][0].date(),
+                chronology[row.snapshot_id],
+            )
+            previous_priority = (
+                None
+                if previous is None
+                else (
+                    previous.verified_at or chronology[previous.snapshot_id][0].date(),
+                    chronology[previous.snapshot_id],
+                )
+            )
+            if previous_priority is None or priority > previous_priority:
+                latest_claims[claim] = row
+        grouped: dict[Capability, list[CapabilityObservation]] = {}
+        for row in sorted(
+            latest_claims.values(),
+            key=lambda item: (
+                item.capability, item.source_provider, item.source_reference, item.source_type
+            ),
+        ):
             capability = Capability(row.capability)
             grouped.setdefault(capability, []).append(
                 CapabilityObservation(
@@ -605,6 +722,8 @@ class EvidenceRepository:
                     source_reference=row.source_reference,
                     source_type=CapabilitySourceType(row.source_type),
                     confidence=row.confidence,
+                    verified_at=row.verified_at,
+                    source_revision=row.source_revision,
                 )
             )
         return {
@@ -613,6 +732,47 @@ class EvidenceRepository:
             )
             for capability, observations in grouped.items()
         }
+
+    def list_compatible_capability_snapshots(
+        self, vehicle_snapshot: SnapshotRef
+    ) -> tuple[SnapshotRef, ...]:
+        """Return newest API evidence plus compatible curated revisions."""
+
+        compatible = tuple(
+            candidate
+            for candidate in self.list_snapshots(DatasetType.CAPABILITIES)
+            if self.component_compatibility(vehicle_snapshot, candidate).compatible
+        )
+        with self.session() as session:
+            api_ids = set(
+                session.scalars(
+                    select(CapabilityObservationRow.snapshot_id)
+                    .where(
+                        CapabilityObservationRow.snapshot_id.in_(
+                            tuple(item.snapshot_id for item in compatible)
+                        ),
+                        CapabilityObservationRow.source_type
+                        == CapabilitySourceType.COMMUNITY_API.value,
+                    )
+                )
+            )
+        newest_api_id = next(
+            (
+                item.snapshot_id
+                for item in sorted(
+                    compatible,
+                    key=lambda candidate: (candidate.retrieved_at, candidate.snapshot_id),
+                    reverse=True,
+                )
+                if item.snapshot_id in api_ids
+            ),
+            None,
+        )
+        return tuple(
+            item
+            for item in compatible
+            if item.snapshot_id not in api_ids or item.snapshot_id == newest_api_id
+        )
 
     def import_availability_snapshot(
         self,
@@ -882,6 +1042,7 @@ class EvidenceRepository:
                         reported_kd=item.reported_kd,
                         reported_kills_per_battle=item.reported_kills_per_battle,
                         ratio_provenance=ratio_provenance,
+                        kill_target_definition=item.kill_target_definition.value,
                     )
                 )
             if diagnostics is not None:
@@ -906,6 +1067,7 @@ class EvidenceRepository:
             dataset.snapshot,
             records,
             raw_content=dataset.raw_content,
+            provider_version=dataset.normalization_revision,
         )
 
     def get_statistics_import_diagnostics(
@@ -1395,6 +1557,7 @@ class EvidenceRepository:
                     reported_win_rate=row.reported_win_rate,
                     reported_kd=row.reported_kd,
                     reported_kills_per_battle=row.reported_kills_per_battle,
+                    kill_target_definition=KillTargetDefinition(row.kill_target_definition),
                 )
                 for row in rows
             )
