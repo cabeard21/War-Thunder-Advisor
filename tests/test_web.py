@@ -1,3 +1,5 @@
+from unittest.mock import Mock
+
 from fastapi.testclient import TestClient
 
 from wt_advisor.services.advisor import AdvisorService
@@ -8,6 +10,38 @@ def test_local_dashboard_api_returns_data_and_rejects_external_host() -> None:
     client = TestClient(create_app(AdvisorService.from_acceptance_fixture()))
     assert client.get("/api/data-status").status_code == 200
     assert client.get("/api/data-status", headers={"host": "example.com"}).status_code == 400
+
+
+def test_community_refresh_route_uses_shared_service_without_request_body() -> None:
+    service = AdvisorService.from_acceptance_fixture()
+    service.refresh_community_evidence = Mock(
+        return_value={"outcome": "updated", "bundle_id": "new"}
+    )
+    client = TestClient(create_app(service))
+
+    response = client.post("/api/data/refresh-community")
+
+    assert response.status_code == 200
+    assert response.json() == {"data": {"outcome": "updated", "bundle_id": "new"}}
+    service.refresh_community_evidence.assert_called_once_with()
+    same_origin = client.post(
+        "/api/data/refresh-community", headers={"origin": "http://testserver"}
+    )
+    assert same_origin.status_code == 200
+
+
+def test_community_refresh_route_rejects_cross_origin_and_cross_site() -> None:
+    service = AdvisorService.from_acceptance_fixture()
+    service.refresh_community_evidence = Mock(return_value={"outcome": "updated"})
+    client = TestClient(create_app(service))
+
+    assert client.post(
+        "/api/data/refresh-community", headers={"origin": "http://evil.test/?next=localhost"}
+    ).status_code == 403
+    assert client.post(
+        "/api/data/refresh-community", headers={"sec-fetch-site": "cross-site"}
+    ).status_code == 403
+    service.refresh_community_evidence.assert_not_called()
 
 
 def test_packaged_dashboard_index_is_served_without_vite() -> None:

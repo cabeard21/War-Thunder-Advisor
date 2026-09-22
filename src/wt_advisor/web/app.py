@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -106,7 +107,20 @@ def create_app(service: AdvisorService | None = None) -> FastAPI:
             )
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             origin = request.headers.get("origin")
-            if origin and host not in origin:
+            parsed_origin = urlsplit(origin) if origin else None
+            request_authority = request.headers.get("host", "").lower()
+            origin_authority = parsed_origin.netloc.lower() if parsed_origin else None
+            if (
+                (origin and (
+                    parsed_origin is None
+                    or parsed_origin.scheme != request.url.scheme
+                    or origin_authority != request_authority
+                    or parsed_origin.path not in {"", "/"}
+                    or parsed_origin.query
+                    or parsed_origin.fragment
+                ))
+                or request.headers.get("sec-fetch-site") == "cross-site"
+            ):
                 return JSONResponse(
                     status_code=403,
                     content={
@@ -125,6 +139,10 @@ def create_app(service: AdvisorService | None = None) -> FastAPI:
     @app.get("/api/data-status")
     def data_status() -> dict[str, Any]:
         return {"data": resolved.data_status()}
+
+    @app.post("/api/data/refresh-community")
+    def refresh_community_evidence() -> dict[str, Any]:
+        return {"data": _dump(resolved.refresh_community_evidence())}
 
     @app.get("/api/vehicles")
     def vehicles() -> dict[str, Any]:
