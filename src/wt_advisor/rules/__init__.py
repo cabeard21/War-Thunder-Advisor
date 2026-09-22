@@ -16,6 +16,7 @@ from .engine import (
     role_redundancy_rule,
     scouting_rule,
     statistical_strength_rule,
+    statistics_eligibility,
     uptier_resilience_rule,
 )
 
@@ -35,5 +36,6 @@ __all__ = [
     "role_redundancy_rule",
     "scouting_rule",
     "statistical_strength_rule",
+    "statistics_eligibility",
     "uptier_resilience_rule",
 ]

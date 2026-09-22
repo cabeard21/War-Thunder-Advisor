@@ -1,4 +1,5 @@
 ruleset_id = "m2-capability-aware-v1"
+scoring_policy_version = "community-rb-proxy-v1"
 
 [weights]
 br_cohesion = 0.25
@@ -44,6 +45,7 @@ kills_per_battle_k = 1000.0
 kd_k = 250.0
 minimum_peers = 5
 neutral_score = 50.0
+community_proxy_factor = 0.5
 
 [readiness]
 minimum_within_one_step = 2

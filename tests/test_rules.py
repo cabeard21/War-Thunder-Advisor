@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date
+
 import pytest
 
 from wt_advisor.domain.models import (
@@ -36,6 +38,7 @@ def vehicle(
     vehicle_id: str,
     vehicle_class: VehicleClass,
     *capabilities: Capability,
+    rank: int = 1,
 ) -> Vehicle:
     return Vehicle(
         vehicle_id=vehicle_id,
@@ -43,7 +46,7 @@ def vehicle(
         name=vehicle_id,
         nation=Nation.USA,
         vehicle_class=vehicle_class,
-        rank=1,
+        rank=rank,
         capabilities=frozenset(capabilities),
     )
 
@@ -256,6 +259,37 @@ def test_m2_scouting_distinguishes_present_absent_and_incomplete_evidence() -> N
     assert incomplete.status is RuleStatus.UNKNOWN
     assert incomplete.evidence["state"] == "unknown"
     assert incomplete.warnings == ("capability_evidence_incomplete",)
+
+
+def test_m2_rank_two_light_unknown_scouting_has_labeled_modest_proxy() -> None:
+    ruleset = load_ruleset("m2-capability-aware-v1")
+    light = vehicle("light", VehicleClass.LIGHT_TANK, rank=2)
+    result = scouting_rule((light,), ruleset)
+
+    assert result.score is None
+    assert result.status is RuleStatus.UNKNOWN
+    assert result.effective_score == 65
+    assert result.evidence["state"] == "unknown"
+    assert result.evidence["state_by_vehicle"] == {"light": "unknown"}
+    assert result.evidence["heuristic"] == {
+        "id": "rank-ii-light-tank-scouting-v1",
+        "vehicle_ids": ["light"],
+        "basis": "rank_ii_or_higher_light_tank_with_unknown_scouting",
+        "verified_capability": False,
+    }
+
+
+@pytest.mark.parametrize("state", ["verified_absent", "conflicted"])
+def test_m2_scouting_proxy_does_not_override_explicit_evidence(state: str) -> None:
+    light = vehicle("light", VehicleClass.LIGHT_TANK, rank=2)
+    result = scouting_rule(
+        (light,),
+        load_ruleset("m2-capability-aware-v1"),
+        capability_resolutions={"light": {Capability.SCOUTING: state}},
+    )
+
+    assert "heuristic" not in result.evidence
+    assert result.effective_score == (0 if state == "verified_absent" else 50)
 
 
 def test_m2_uptier_proxy_exposes_capability_inputs_and_never_calls_unknown_low() -> None:
@@ -471,6 +505,144 @@ def test_statistical_strength_exposes_peer_scope_confidence_and_fallback() -> No
     assert evidence["peer_count"] == 5
     assert evidence["scope"] == "ground_realistic_ground_vehicles"
     assert 0 < evidence["confidence_weight"] < 1
+
+
+def test_community_rb_proxy_uses_reported_peers_and_halves_deviation() -> None:
+    target = vehicle("target", VehicleClass.MEDIUM_TANK)
+    peers = tuple(
+        PeerStatistic(
+            vehicle=vehicle(f"peer_{index}", VehicleClass.MEDIUM_TANK),
+            battle_rating=20,
+            statistics=VehicleStatistics(
+                vehicle_id=f"peer_{index}", snapshot_id="community",
+                mode_scope=StatisticsScope.REALISTIC_ALL_CONTEXTS,
+                sample_end=date(2026, 9, 20), battles=3000,
+                reported_win_rate=0.45 + index * 0.02,
+                reported_kills_per_battle=0.8 + index * 0.1,
+            ),
+        ) for index in range(5)
+    )
+    observation = VehicleStatistics(
+        vehicle_id="target", snapshot_id="community",
+        mode_scope=StatisticsScope.REALISTIC_ALL_CONTEXTS,
+        sample_end=date(2026, 9, 20), battles=3000,
+        reported_win_rate=0.62, reported_kills_per_battle=1.8,
+    )
+    result = statistical_strength_rule(
+        (target,), {"target": 20}, {"target": observation}, peers,
+        ruleset=load_ruleset("m2-capability-aware-v1"),
+        evaluation_date=date(2026, 9, 21),
+    )
+    detail = result.evidence["vehicles"]["target"]
+    assert detail["eligibility"] == "eligible"
+    assert detail["proxy_used"] is True
+    assert detail["source_scope"] == "realistic_all_contexts"
+    assert detail["kd"]["score"] is None
+    assert detail["win_rate"]["score"] == pytest.approx(
+        50 + (detail["win_rate"]["unattenuated_score"] - 50) * 0.5
+    )
+    assert result.score is not None and result.score > 50
+
+
+def test_ground_kd_uses_battles_as_labeled_confidence_proxy_and_matching_peers() -> None:
+    from wt_advisor.domain.models import KillTargetDefinition
+
+    target = vehicle("target", VehicleClass.MEDIUM_TANK)
+    observation = VehicleStatistics(
+        vehicle_id="target", snapshot_id="community",
+        mode_scope=StatisticsScope.REALISTIC_ALL_CONTEXTS,
+        sample_end=date(2026, 9, 20), battles=69,
+        reported_kd=1.38, kill_target_definition=KillTargetDefinition.GROUND_TARGETS,
+    )
+    peers = tuple(
+        PeerStatistic(
+            vehicle=vehicle(f"peer_{index}", VehicleClass.MEDIUM_TANK),
+            battle_rating=20,
+            statistics=observation.model_copy(update={
+                "vehicle_id": f"peer_{index}", "reported_kd": 0.8 + index * 0.2,
+            }),
+        ) for index in range(5)
+    )
+    result = statistical_strength_rule(
+        (target,), {"target": 20}, {"target": observation}, peers,
+        ruleset=load_ruleset("m2-capability-aware-v1"),
+        evaluation_date=date(2026, 9, 21),
+    )
+    kd = result.evidence["vehicles"]["target"]["kd"]
+    assert kd["raw_value"] == 1.38
+    assert kd["sample_size"] == 69
+    assert kd["sample_size_definition"] == "battles_confidence_proxy"
+    assert kd["metric_definition"] == "ground_kills_per_death"
+    assert kd["peer_count"] == 5
+
+
+def test_ground_metric_does_not_compare_with_all_target_peers() -> None:
+    from wt_advisor.domain.models import KillTargetDefinition
+
+    target = vehicle("target", VehicleClass.MEDIUM_TANK)
+    observation = VehicleStatistics(
+        vehicle_id="target", snapshot_id="community",
+        mode_scope=StatisticsScope.REALISTIC_ALL_CONTEXTS,
+        sample_end=date(2026, 9, 20), battles=69,
+        reported_kd=1.38, reported_win_rate=0.6,
+        kill_target_definition=KillTargetDefinition.GROUND_TARGETS,
+    )
+    peers = tuple(
+        PeerStatistic(
+            vehicle=vehicle(f"peer_{index}", VehicleClass.MEDIUM_TANK),
+            battle_rating=20,
+            statistics=observation.model_copy(update={
+                "vehicle_id": f"peer_{index}",
+                "kill_target_definition": KillTargetDefinition.ALL_TARGETS,
+                "reported_win_rate": 0.45 + index * 0.02,
+            }),
+        ) for index in range(5)
+    )
+    result = statistical_strength_rule(
+        (target,), {"target": 20}, {"target": observation}, peers,
+        ruleset=load_ruleset("m2-capability-aware-v1"),
+        evaluation_date=date(2026, 9, 21),
+    )
+    detail = result.evidence["vehicles"]["target"]
+    assert detail["win_rate"]["score"] is not None
+    assert detail["kd"]["score"] is None
+
+
+def test_community_proxy_requires_age_and_five_matching_metric_peers() -> None:
+    target = vehicle("target", VehicleClass.MEDIUM_TANK)
+    observation = VehicleStatistics(
+        vehicle_id="target", snapshot_id="community",
+        mode_scope=StatisticsScope.REALISTIC_ALL_CONTEXTS,
+        sample_end=date(2026, 9, 20), battles=100,
+        reported_win_rate=0.6,
+    )
+    peers = tuple(
+        PeerStatistic(
+            vehicle=vehicle(f"peer_{index}", VehicleClass.MEDIUM_TANK),
+            battle_rating=20,
+            statistics=observation.model_copy(update={
+                "vehicle_id": f"peer_{index}",
+                "reported_win_rate": 0.45 + index * 0.02,
+                "sample_end": date(2026, 9, 19) if index == 4 else date(2026, 9, 20),
+            }),
+        ) for index in range(5)
+    )
+    result = statistical_strength_rule(
+        (target,), {"target": 20}, {"target": observation}, peers,
+        ruleset=load_ruleset("m2-capability-aware-v1"),
+        evaluation_date=date(2026, 9, 21),
+    )
+    assert result.score is None
+    assert (
+        result.evidence["vehicles"]["target"]["exclusion_reason"]
+        == "insufficient_compatible_peers"
+    )
+    old = statistical_strength_rule(
+        (target,), {"target": 20}, {"target": observation}, peers,
+        ruleset=load_ruleset("m2-capability-aware-v1"),
+        evaluation_date=date(2026, 12, 22),
+    )
+    assert old.evidence["vehicles"]["target"]["exclusion_reason"] == "observation_too_old"
 
 
 def test_statistics_missing_or_incompatible_stay_visible_and_use_neutral_effective_score() -> None:
