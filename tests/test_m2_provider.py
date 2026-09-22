@@ -367,7 +367,7 @@ def test_vehicle_list_cache_and_detail_normalization_cover_safe_fallbacks() -> N
     ) == ()
 
 
-def test_component_fetch_rejects_empty_or_over_limit_detail_selection() -> None:
+def test_component_fetch_keeps_full_list_but_prioritizes_bounded_details() -> None:
     base_url = "https://example.com/api/vehicles"
     empty = WarThunderVehiclesApiProvider(
         cache=_Cache({f"wt-vehicles-api:{base_url}": b"[]"}), base_url=base_url
@@ -388,17 +388,69 @@ def test_component_fetch_rejects_empty_or_over_limit_detail_selection() -> None:
         ],
         "totalPages": 1,
     }
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        source_id = request.url.path.rsplit("/", 1)[-1]
+        if source_id in {"us_one", "us_two"}:
+            requested.append(source_id)
+            return httpx.Response(200, json=_detail(source_id), request=request)
+        return httpx.Response(200, json=rows, request=request)
+
     provider = WarThunderVehiclesApiProvider(
         client=httpx.Client(
-            transport=httpx.MockTransport(
-                lambda request: httpx.Response(200, json=rows, request=request)
-            )
+            transport=httpx.MockTransport(handler)
         ),
         base_url=base_url,
         retry_delay_seconds=0,
     )
-    with pytest.raises(ProviderPayloadError, match="detail request count"):
-        provider.fetch_operational_components(max_details=1)
+    bundle = provider.fetch_operational_components(
+        max_details=1, priority_vehicle_ids=("us_two",)
+    )
+    assert requested == ["us_two"]
+    assert {row.vehicle_id for row in bundle.vehicles.records} == {"us_one", "us_two"}
+    assert {row.vehicle_id for row in bundle.availability.records} == {"us_one", "us_two"}
+    assert [row.vehicle_id for row in bundle.capabilities.records] == ["us_two"]
+
+
+def test_component_detail_fallback_uses_br_then_id_not_list_order() -> None:
+    rows = {
+        "vehicles": [
+            {
+                "identifier": identifier,
+                "country": "usa",
+                "vehicle_class": "light_tank",
+                "rank": 2,
+                "realistic_ground_br": br,
+            }
+            for identifier, br in (("us_z", 3.7), ("us_b", 2.7), ("us_a", 2.7))
+        ],
+        "totalPages": 1,
+    }
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        source_id = request.url.path.rsplit("/", 1)[-1]
+        if source_id in {"us_z", "us_b", "us_a"}:
+            requested.append(source_id)
+            return httpx.Response(200, json=_detail(source_id), request=request)
+        return httpx.Response(200, json=rows, request=request)
+
+    provider = WarThunderVehiclesApiProvider(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        base_url="https://example.com/api/vehicles",
+        retry_delay_seconds=0,
+    )
+    provider.fetch_operational_components(max_details=2, priority_vehicle_ids=("us_z",))
+    assert requested == ["us_z", "us_a"]
+
+    requested.clear()
+    provider.fetch_operational_components(
+        max_details=2,
+        priority_vehicle_ids=("us_z",),
+        previously_fetched_ids=("us_z", "us_a"),
+    )
+    assert requested == ["us_z", "us_b"]
 
 
 def test_operational_components_activate_after_persistence(tmp_path) -> None:

@@ -10,6 +10,7 @@ import ipaddress
 import json
 import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -557,7 +558,12 @@ class WarThunderVehiclesApiProvider:
         )
 
     def fetch_operational_components(
-        self, *, max_br: int = 40, max_details: int = 100
+        self,
+        *,
+        max_br: int = 40,
+        max_details: int = 100,
+        priority_vehicle_ids: Sequence[str] = (),
+        previously_fetched_ids: Sequence[str] = (),
     ) -> OperationalEvidenceBundle:
         """Fetch bounded USA Ground detail evidence for capabilities and prerequisites."""
 
@@ -566,11 +572,26 @@ class WarThunderVehiclesApiProvider:
         if max_details < 1 or max_details > 200:
             raise ValueError("max_details must be between one and 200")
         vehicles = self.fetch_vehicles()
-        selected = tuple(
+        eligible = tuple(
             row for row in vehicles.records if row.ground_realistic_br <= max_br
         )
-        if len(selected) > max_details:
-            raise ProviderPayloadError("detail request count exceeds configured limit")
+        priority_order = {
+            vehicle_id: position
+            for position, vehicle_id in enumerate(priority_vehicle_ids)
+        }
+        previously_fetched = frozenset(previously_fetched_ids)
+        selected = tuple(
+            sorted(
+                eligible,
+                key=lambda row: (
+                    row.vehicle_id not in priority_order,
+                    priority_order.get(row.vehicle_id, len(priority_order)),
+                    row.vehicle_id in previously_fetched,
+                    row.ground_realistic_br,
+                    row.vehicle_id,
+                ),
+            )[:max_details]
+        )
 
         details: list[dict[str, Any]] = []
         detail_revisions: set[str] = set()
