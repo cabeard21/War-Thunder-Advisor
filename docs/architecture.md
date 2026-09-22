@@ -9,7 +9,7 @@ providers / fixtures -> immutable snapshots -> domain services -> CLI and MCP
 
 ## Evidence and storage
 
-SQLite is managed by Alembic through revision `0005`. Imported payloads create immutable dataset
+SQLite is managed by Alembic through revision `0006`. Imported payloads create immutable dataset
 snapshots and raw artifacts. Metadata, capabilities, resolved availability, identity aliases,
 research graphs, and statistics are independently versioned components. User profiles and vehicle
 statuses are stored separately and revisioned on mutation; alias reconciliation has dry-run,
@@ -37,13 +37,26 @@ Progression reports `progression_unavailable` when no compatible graph exists an
 unrelated tree. `get_data_status` reports availability, freshness, coverage, gaps, and the selected
 snapshot for every component.
 
+Capability status retains the legacy vehicle-record coverage count and separately
+reports resolved field coverage for every capability used by scoring. It shows
+catalog and owned/immediate-research scopes, per-field present/verified-absent/
+unknown/conflicted counts, and bounded missing vehicle/capability pairs. The
+legacy `vehicle.capabilities` set describes embedded vehicle metadata; clients
+must use `provenance.capability_resolutions` for current M2 evidence. The active
+bundle includes all selected compatible capability snapshot IDs. The newest
+community-API snapshot and compatible curated revisions resolve by sourced
+claim and source type; the newest verification date of the same claim
+supersedes it, while contradictory different claims remain a conflict. Old
+stored evaluations are not rewritten.
+
 ## Providers
 
 - `FixtureProvider` supplies network-free acceptance evidence.
 - `WarThunderVehiclesApiProvider` is a bounded, cached, retrying HTTP adapter. Detail records map
   only explicit scouting, artillery, smoke, vertical-stabilizer, and predecessor facts; omission is
   not false.
-- Strict bounded JSON/YAML importers handle capability, availability, and research-graph evidence.
+- Strict bounded JSON/YAML importers handle capability, availability, and research-graph evidence;
+  curated capability imports retain per-observation verification date and source revision.
 - JSON and CSV statistics inspection validates identity match rate, duplicates, scope, sample
   period, and metric coverage before import.
 - YAML overrides require a revision, vehicle ID, field, typed value, reason, reference, and date.

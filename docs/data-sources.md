@@ -35,6 +35,67 @@ StatShark remains manual-import-only for Milestone 2. A documented user export
 may be inspected and imported, but the application will not automate browser
 scraping, bypass anti-bot controls, or call undocumented endpoints.
 
+## Operational evidence follow-up (2026-09-21)
+
+### On-demand community refresh
+
+The CLI, local dashboard, and MCP now call the same `refresh_community_evidence`
+service operation. It fetches the USA ground catalog and at most 25 prioritized
+vehicle details per attempt, choosing unseen catalog vehicles after profile
+priorities on subsequent refreshes. It validates a replacement and publishes related
+snapshots in one transaction. If the community API rate-limits or rejects the
+request, the prior bundle remains active. A partial detail refresh does not replace
+a broader compatible research graph. No scheduled or official-site scraper is used.
+
+The [WT Data Project's public joined CSVs](https://github.com/ControlNet/wt-data-project.data)
+are an additional, dated community source. The adapter selects the latest
+bounded CSV, uses exact source IDs, quarantines invalid/ambiguous rows, and
+records the source revision and observation date. Its README describes
+ThunderSkill Realistic Battles statistics and acknowledges imperfect Wiki joins;
+it does **not** establish Ground RB-only match scope. Imported rows retain
+`realistic_all_contexts`. Unambiguously mapped ground vehicles can contribute
+as **Community RB ground-vehicle proxy** evidence. The policy halves each
+sample-adjusted metric's deviation from the neutral score of 50 and prefers
+verified Ground RB evidence. A proxy needs positive battles, an observation
+no more than 90 days old, and compatible peers sharing source, scope, period,
+and metric definition. Missing metrics remain unknown. Aircraft, wrong-mode,
+ambiguous, invalid, and synthetic acceptance rows do not gain proxy eligibility.
+The joined CSV's `rb_ground_frags_per_death` is reported ground kills/death;
+`rb_ground_frags_per_battle` is reported ground kills/battle. Both are
+ground-target metrics, not all-target K/D or Ground RB-only measurements.
+`rb_win_rate` is reported in percent and normalized to a fraction for scoring.
+Each metric is imported independently, so a blank or invalid field does not
+erase the other reported fields; numeric zero is a reported value, not missing.
+The CSV does not provide a death count, so battles are used only as a confidence
+proxy for ground kills/death. Metric definitions must match across peers, and
+the five-peer minimum and existing shrinkage still apply. A corrected parser
+revision can produce a new normalized snapshot from unchanged raw source bytes;
+prior snapshots remain intact.
+The synthetic acceptance statistics remain separate. A September 21 read-only check found a September 20 CSV;
+against the small acceptance catalog, four rows mapped and the rest were
+out of scope or unmapped. This is a source-availability check, not live-database
+acceptance or a claim of complete catalog coverage.
+
+An earlier live-database inspection found only the synthetic acceptance
+statistics fixture. The later successful community refresh stored 141
+statistics rows; import count alone does not establish scoring eligibility.
+The StatShark global statistics page returned HTTP 403 during the earlier
+source check, and no documented permitted Ground RB battle-performance API or
+export was verified. The community Vehicles API documents vehicle/game-file
+data, not that export. The proxy does not assert Ground RB-only scope. Do not
+re-label fixture rows or scrape undocumented endpoints.
+
+Curated capability observations can now be imported with `wt-advisor
+capabilities import`. The [synthetic example](examples/capability-import-synthetic.json)
+is schema-shaped test material, **not** a claim about the M3 Lee or the game.
+Replace every value and reference with independently verified evidence before
+an operational import. Each curated row requires a canonical vehicle ID,
+capability, strict boolean value, provider, reference, `verified_at` date, and
+`source_revision`. `source_type` is `curated_import`; omission is never false.
+Use the active operational vehicle snapshot ID from `data status` as the
+`--vehicle-snapshot-id` guard. Compatible curated observations survive provider
+refreshes; differing source-backed claims remain conflicted until investigated.
+
 ## War Thunder Vehicles community API
 
 - Project: <https://github.com/Sgambe33/WarThunder-Vehicles-API>
