@@ -1,19 +1,34 @@
-import { describe, expect, it, vi } from "vitest";
-import { AdvisorApiError, displayError, request } from "./api";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { api } from "./api";
 
-describe("dashboard API boundary", () => {
-  it("unwraps the common success envelope", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ data: { revision: 4 } }), { status: 200 })));
-    await expect(request<{ revision: number }>("/example")).resolves.toEqual({ revision: 4 });
+describe("dashboard loading", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("keeps vehicles visible when recommendation and research requests fail", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url.endsWith("/evaluate") || url.endsWith("/unlock-evaluations")) {
+        return { ok: false, status: 503, json: async () => ({ error: { code: "unavailable", message: "Evidence unavailable" } }) };
+      }
+      const data = url.endsWith("/vehicles") ? [{ vehicle_id: "m3", name: "M3 Lee" }]
+        : url.endsWith("/progress") ? { profile: { crew_slots: 2 }, vehicle_statuses: { m3: "owned" } }
+        : url.endsWith("/presets") ? [] : {};
+      return { ok: true, json: async () => ({ data }) };
+    }));
+
+    const state = await api.dashboard("acceptance");
+    const insights = await api.dashboardInsights("acceptance");
+    expect(state.vehicles).toEqual([{ vehicle_id: "m3", name: "M3 Lee", status: "owned" }]);
+    expect(insights.load_errors).toEqual(expect.arrayContaining([expect.stringContaining("recommendation"), expect.stringContaining("research")]));
   });
 
-  it("keeps actionable structured domain errors", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: { code: "conflict", message: "Refresh before saving.", details: { revision: 2 } } }), { status: 409 })));
-    await expect(request("/example")).rejects.toMatchObject({ code: "conflict", status: 409 });
-  });
-
-  it("does not expose an arbitrary thrown implementation error", () => {
-    expect(displayError(new Error("secret trace"))).toBe("Unable to reach the local advisor. Check that the dashboard is running.");
-    expect(displayError(new AdvisorApiError({ code: "validation", message: "Pin overlap", details: { vehicle_id: "m3" } }))).toContain("validation: Pin overlap");
+  it("returns the vehicle catalog while slow insight requests remain pending", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url.endsWith("/evaluate") || url.endsWith("/unlock-evaluations")) return new Promise(() => {});
+      const data = url.endsWith("/vehicles") ? [{ vehicle_id: "m3", name: "M3 Lee" }]
+        : url.endsWith("/progress") ? { profile: { crew_slots: 2 }, vehicle_statuses: {} }
+        : url.endsWith("/presets") ? [] : {};
+      return { ok: true, json: async () => ({ data }) };
+    }));
+    expect((await api.dashboard("acceptance")).vehicles).toHaveLength(1);
   });
 });

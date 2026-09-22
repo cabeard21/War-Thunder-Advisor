@@ -36,6 +36,7 @@ export interface Preset {
 }
 
 export interface DashboardState {
+  load_errors?: string[];
   profile?: RecordValue;
   context?: Context;
   vehicles?: Vehicle[];
@@ -43,4 +44,22 @@ export interface DashboardState {
   research_next?: RecordValue | Json[];
   evidence_health?: RecordValue;
   presets?: Preset[];
+}
+
+export interface CommunityRefreshResult {
+  outcome: "updated" | "unchanged" | "failed" | "restart_required";
+  previous_bundle_id?: string | null;
+  bundle_id?: string | null;
+  accepted_statistics_rows?: number;
+  quarantined_statistics_rows?: number;
+  statistics_status?: string;
+  eligible_statistics_rows?: number;
+  statistics_source_url?: string | null;
+  statistics_source_revision?: string | null;
+  source_observation_date?: string | null;
+  statistics_age_days?: number | null;
+  statistics_limitations?: string | null;
+  message?: string;
+  before_coverage?: Json;
+  after_coverage?: Json;
 }

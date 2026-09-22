@@ -63,8 +63,41 @@ test.afterAll(() => {
   rmSync(runDir, { recursive: true, force: true });
 });
 
+test("shows readable names when the vehicle API returns internal identifiers", async ({ page }) => {
+  await page.route("**/api/vehicles", async (route) => {
+    const response = await route.fetch();
+    const payload = await response.json();
+    const first = payload.data[0];
+    payload.data[0] = { ...first, name: first.vehicle_id };
+    await route.fulfill({ response, json: payload });
+  });
+  await page.goto(`${origin}/?profile=${profileId}`);
+  await expect(page.locator("article.vehicle").first().locator("strong")).toHaveText("M2A4");
+});
+
+test("community refresh updates the dashboard without clearing a draft", async ({ page }) => {
+  let refreshCalls = 0;
+  await page.route("**/api/data/refresh-community", async (route) => {
+    refreshCalls += 1;
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
+      data: { outcome: "updated", bundle_id: "browser-test", accepted_statistics_rows: 3,
+        quarantined_statistics_rows: 1, statistics_status: "usable", message: "Evidence updated." },
+    }) });
+  });
+  await page.goto(`${origin}/?profile=${profileId}`);
+  const firstName = await page.locator("article.vehicle").first().locator("strong").textContent();
+  await page.locator("article.vehicle").first().getByRole("button", { name: "Draft" }).click();
+
+  await page.getByRole("button", { name: "Refresh community evidence" }).click();
+
+  await expect(page.getByRole("status")).toContainText("Evidence updated.");
+  await expect(page.locator("ol.slots")).toContainText(firstName ?? "");
+  await expect(page.getByText(/Community refresh: updated/)).toBeVisible();
+  expect(refreshCalls).toBe(1);
+});
+
 test("complete dashboard workflow survives conflicts and an actual process restart", async ({ page }) => {
-  const vehicles = await api("/api/vehicles") as Array<{ vehicle_id: string }>;
+  const vehicles = await api("/api/vehicles") as Array<{ vehicle_id: string; name: string }>;
   expect(vehicles.length).toBeGreaterThanOrEqual(3);
   const [first, second, third] = vehicles.slice(0, 3).map((vehicle) => vehicle.vehicle_id);
   for (const vehicleId of [first, second, third]) {
@@ -81,9 +114,9 @@ test("complete dashboard workflow survives conflicts and an actual process resta
   await secondRow.getByRole("button", { name: "Draft" }).click();
   await firstRow.getByRole("button", { name: "Pin" }).click();
   await thirdRow.getByRole("button", { name: "Exclude" }).click();
-  await page.getByRole("button", { name: "Refresh" }).click();
-  await expect(page.locator("ol.slots")).toContainText(first);
-  await expect(page.locator("ol.slots")).toContainText(second);
+  await page.getByRole("button", { name: "Refresh", exact: true }).click();
+  await expect(page.locator("ol.slots")).toContainText(vehicles[0].name);
+  await expect(page.locator("ol.slots")).toContainText(vehicles[1].name);
 
   await page.getByRole("button", { name: "Apply constraints" }).click();
   await expect(page.getByRole("status")).toContainText("Constraints applied");
@@ -122,7 +155,7 @@ test("complete dashboard workflow survives conflicts and an actual process resta
   await expect(page.getByText("Selected context", { exact: true })).toBeVisible();
   await expect(page.locator("article.vehicle").nth(0).getByRole("combobox")).toHaveValue("researching");
   await page.getByRole("button", { name: "Load" }).click();
-  await expect(page.locator("ol.slots")).toContainText(first);
+  await expect(page.locator("ol.slots")).toContainText(vehicles[0].name);
   await page.getByRole("button", { name: "Delete" }).click();
   await expect(page.getByText("Restart lineup renamed", { exact: true })).toHaveCount(0);
 });

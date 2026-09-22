@@ -1,6 +1,7 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { AdvisorApiError, api, displayError } from "./api";
-import type { DashboardState, Json, Preset, RecordValue, Vehicle } from "./types";
+import type { CommunityRefreshResult, DashboardState, Json, Preset, RecordValue, Vehicle } from "./types";
+import { vehicleName } from "./vehicle-name";
 
 const statuses = ["owned", "unlocked_not_purchased", "researching", "available_to_research", "locked", "unknown"];
 const profileFromUrl = new URLSearchParams(window.location.search).get("profile") ?? "acceptance";
@@ -8,9 +9,35 @@ const profileFromUrl = new URLSearchParams(window.location.search).get("profile"
 function asRecord(value: unknown): RecordValue {
   return value && typeof value === "object" && !Array.isArray(value) ? value as RecordValue : {};
 }
-function title(vehicle: Vehicle) { return vehicle.name ?? vehicle.vehicle_id; }
+function title(vehicle: Vehicle) { return vehicleName(vehicle); }
 function br(value: unknown) { return typeof value === "number" ? (value / 10).toFixed(1) : "?"; }
 function list(value: unknown): string[] { return Array.isArray(value) ? value.filter((x): x is string => typeof x === "string") : []; }
+
+function metricLabel(raw: unknown, definition: string, label: string): string | null {
+  const metric = asRecord(raw);
+  if (metric.metric_definition !== definition) return null;
+  const source = typeof metric.source_field === "string" ? ` (${metric.source_field})` : "";
+  return `${label}${source}`;
+}
+
+function StatisticsEvidence({ analysis, vehicleName }: { analysis: RecordValue; vehicleName: (id: string) => string }) {
+  const rules = Array.isArray(analysis.rules) ? analysis.rules : [];
+  const statistical = rules.map(asRecord).find((rule) => rule.rule === "statistical_strength");
+  const vehicles = asRecord(asRecord(statistical?.evidence).vehicles);
+  const entries = Object.entries(vehicles);
+  if (!entries.length) return null;
+  return <div className="statistics-evidence"><strong>Statistical evidence</strong><ul>{entries.map(([id, raw]) => {
+    const evidence = asRecord(raw);
+    const label = typeof evidence.evidence_label === "string" ? evidence.evidence_label : "Statistics";
+    const eligible = evidence.eligible === true;
+    const proxy = evidence.proxy_used === true;
+    const scope = typeof evidence.source_scope === "string" ? evidence.source_scope : null;
+    const provider = typeof evidence.source_provider === "string" ? evidence.source_provider : null;
+    const reason = typeof evidence.exclusion_reason === "string" ? evidence.exclusion_reason : null;
+    const metrics = [metricLabel(evidence.kd, "ground_kills_per_death", "ground kills/death"), metricLabel(evidence.kills_per_battle, "ground_kills_per_battle", "ground kills/battle")].filter((value): value is string => value !== null);
+    return <li key={id}>{vehicleName(id)}: {eligible ? `${label}${proxy ? " (proxy used)" : ""}` : "statistics excluded"}{scope && <> · scope: {scope}</>}{provider && <> · source: {provider}</>}{metrics.length > 0 && <> · metrics: {metrics.join(", ")}</>}{!eligible && reason && <> · reason: {reason}</>}</li>;
+  })}</ul></div>;
+}
 
 function Detail({ value }: { value: unknown }) {
   return <details><summary>Why / raw evidence</summary><pre>{JSON.stringify(value, null, 2)}</pre></details>;
@@ -32,24 +59,56 @@ export function AdvisorApp() {
   const [editingPreset, setEditingPreset] = useState<Preset>();
   const [pendingStatuses, setPendingStatuses] = useState<Record<string, string>>({});
   const [lastEvaluatedLineup, setLastEvaluatedLineup] = useState<string[]>([]);
+  const [communityRefresh, setCommunityRefresh] = useState<CommunityRefreshResult>();
+  const refreshSequence = useRef(0);
 
   const refresh = async () => {
+    const sequence = ++refreshSequence.current;
     setBusy(true); setError("");
     try {
       const next = await api.dashboard(profileId);
+      if (sequence !== refreshSequence.current) return;
       setState(next);
+      if (next.load_errors?.length) setError(next.load_errors.join(" "));
       const context = asRecord(next.context);
       setRequired(list(context.required_vehicle_ids));
       setExcluded(list(context.excluded_vehicle_ids));
       setTargetBr(typeof context.target_br === "number" ? String(context.target_br / 10) : "");
+      void api.dashboardInsights(profileId).then((insights) => {
+        if (sequence !== refreshSequence.current) return;
+        setState((current) => current ? { ...current, ...insights, load_errors: [...(next.load_errors ?? []), ...(insights.load_errors ?? [])] } : current);
+        if (insights.load_errors?.length) setError([...(next.load_errors ?? []), ...insights.load_errors].join(" "));
+      }).catch((caught) => {
+        if (sequence === refreshSequence.current) setError(`Unable to load dashboard insights: ${displayError(caught)}`);
+      });
+    } catch (caught) {
+      if (sequence === refreshSequence.current) setError(displayError(caught));
+    } finally {
+      if (sequence === refreshSequence.current) setBusy(false);
+    }
+  };
+  useEffect(() => { void refresh(); }, [profileId]);
+
+  const refreshCommunityEvidence = async () => {
+    setBusy(true); setError(""); setNotice("");
+    try {
+      const result = await api.refreshCommunityEvidence();
+      setCommunityRefresh(result);
+      if (result.outcome === "failed") {
+        setError(result.message ?? "Community evidence refresh failed; the previous bundle remains active.");
+        return;
+      }
+      await refresh();
+      setNotice(result.message ?? (result.outcome === "updated" ? "Community evidence updated." : "Community evidence is already current."));
     } catch (caught) { setError(displayError(caught)); }
     finally { setBusy(false); }
   };
-  useEffect(() => { void refresh(); }, [profileId]);
 
   const vehicles = useMemo(() => (state?.vehicles ?? []).filter((vehicle) =>
     !filter || `${title(vehicle)} ${vehicle.vehicle_id} ${vehicle.status ?? ""}`.toLowerCase().includes(filter.toLowerCase()),
   ), [state, filter]);
+  const names = useMemo(() => new Map((state?.vehicles ?? []).map((vehicle) => [vehicle.vehicle_id, title(vehicle)])), [state]);
+  const vehicleName = (id: string) => names.get(id) ?? id;
   const slots = Number(asRecord(state?.profile).crew_slots ?? 5);
   const recommendedAnalysis = asRecord(asRecord(asRecord(state?.play_now).recommended).analysis);
   const generatedLineup = list(asRecord(recommendedAnalysis.lineup).slots);
@@ -87,24 +146,27 @@ export function AdvisorApp() {
     target_br: targetBr ? Math.round(Number(targetBr) * 10) : null,
     selected_preset_id: asRecord(state?.context).selected_preset_id ?? null,
   }), "Constraints applied. Saved presets were not changed.");
-  const selectContext = (presetId: string) => mutate(() => api.updateContext(profileId, {
-    expected_revision: asRecord(state?.context).revision as Json,
-    required_vehicle_ids: required,
-    excluded_vehicle_ids: excluded,
-    target_br: targetBr ? Math.round(Number(targetBr) * 10) : null,
-    selected_preset_id: presetId,
-  }), "Selected preset saved as the active context.");
+  const selectContext = (presetId: string) => mutate(async () => {
+    const context = await api.updateContext(profileId, {
+      expected_revision: asRecord(state?.context).revision as Json,
+      required_vehicle_ids: required,
+      excluded_vehicle_ids: excluded,
+      target_br: targetBr ? Math.round(Number(targetBr) * 10) : null,
+      selected_preset_id: presetId,
+    });
+    setState((old) => old ? { ...old, context: context as DashboardState["context"] } : old);
+  }, "Selected preset saved as the active context.");
   const saveStatus = async (vehicleId: string, attemptedStatus: string) => {
     setPendingStatuses((old) => ({ ...old, [vehicleId]: attemptedStatus }));
     setBusy(true); setError("");
     try {
       const revision = asRecord(state?.profile).revision;
       await api.updateStatus(profileId, vehicleId, attemptedStatus, typeof revision === "string" || typeof revision === "number" ? revision : undefined);
-      await refresh();
       setPendingStatuses((old) => {
         const { [vehicleId]: _saved, ...remaining } = old;
         return remaining;
       });
+      await refresh();
       setNotice("Garage status saved; recommendations refreshed.");
     } catch (caught) {
       if (caught instanceof AdvisorApiError && (caught.code === "conflict" || caught.status === 409)) {
@@ -116,19 +178,29 @@ export function AdvisorApp() {
   const savePreset = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const body = { name: presetName, slots: draft, required_vehicle_ids: required, excluded_vehicle_ids: excluded };
-    await mutate(
-      () => editingPreset
-        ? api.updatePreset(profileId, editingPreset.preset_id, { ...body, expected_revision: editingPreset.revision })
-        : api.createPreset(profileId, body),
-      editingPreset ? "Preset updated." : "Preset saved.",
-    );
-    setPresetName(""); setEditingPreset(undefined);
+    setBusy(true); setError("");
+    try {
+      const saved = editingPreset
+        ? await api.updatePreset(profileId, editingPreset.preset_id, { ...body, expected_revision: editingPreset.revision })
+        : await api.createPreset(profileId, body);
+      setState((old) => old ? {
+        ...old,
+        presets: editingPreset
+          ? (old.presets ?? []).map((item) => item.preset_id === saved.preset_id ? saved : item)
+          : [...(old.presets ?? []), saved],
+      } : old);
+      setNotice(editingPreset ? "Preset updated." : "Preset saved.");
+      setPresetName(""); setEditingPreset(undefined);
+      await refresh();
+    } catch (caught) { setError(displayError(caught)); }
+    finally { setBusy(false); }
   };
 
   return <main className="shell">
     <header className="masthead"><div><p className="eyebrow">LOCAL FIELD CONSOLE</p><h1>War Thunder Advisor</h1><p>Evidence-first Ground RB lineup workbench.</p></div>
       <label>Profile <input value={profileId} onChange={(e) => setProfileId(e.target.value)} aria-label="Profile ID" /></label>
-      <button onClick={() => void refresh()} disabled={busy}>{busy ? "Refreshing…" : "Refresh"}</button></header>
+      <button onClick={() => void refresh()} disabled={busy}>{busy ? "Refreshing…" : "Refresh"}</button>
+      <button onClick={() => void refreshCommunityEvidence()} disabled={busy}>Refresh community evidence</button></header>
     {error && <section className="alert error" role="alert"><strong>Request needs attention.</strong> {error}<button onClick={() => setError("")}>Dismiss</button></section>}
     {notice && <section className="alert success" role="status">{notice}<button onClick={() => setNotice("")}>Dismiss</button></section>}
     <section className="command-strip"><label>Target BR <input inputMode="decimal" value={targetBr} onChange={(e) => setTargetBr(e.target.value)} placeholder="e.g. 3.7" /></label>
@@ -137,7 +209,7 @@ export function AdvisorApp() {
     <div className="layout">
       <section className="panel garage"><div className="panel-title"><div><p className="eyebrow">GARAGE</p><h2>Progression status</h2></div><input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter vehicles" aria-label="Filter vehicles" /></div>
         <div className="vehicle-list">{vehicles.map((vehicle) => <article className="vehicle" key={vehicle.vehicle_id}>
-          <div><strong>{title(vehicle)}</strong><small>{vehicle.vehicle_id} · BR {br(vehicle.battle_rating)} · {vehicle.vehicle_class ?? "unknown class"}</small></div>
+          <div><strong>{title(vehicle)}</strong><small>BR {br(vehicle.battle_rating)} · {vehicle.vehicle_class ?? "unknown class"}</small></div>
           <select aria-label={`Status for ${title(vehicle)}`} value={pendingStatuses[vehicle.vehicle_id] ?? vehicle.status ?? "unknown"} onChange={(e) => void saveStatus(vehicle.vehicle_id, e.target.value)}>{statuses.map((status) => <option key={status}>{status}</option>)}</select>
           {pendingStatuses[vehicle.vehicle_id] && pendingStatuses[vehicle.vehicle_id] !== vehicle.status && <button aria-label={`Retry status for ${title(vehicle)}`} onClick={() => void saveStatus(vehicle.vehicle_id, pendingStatuses[vehicle.vehicle_id])}>Retry</button>}
           <button aria-pressed={draft.includes(vehicle.vehicle_id)} onClick={() => toggle(vehicle.vehicle_id)}>{draft.includes(vehicle.vehicle_id) ? "Remove" : "Draft"}</button>
@@ -145,26 +217,47 @@ export function AdvisorApp() {
           <button className={excluded.includes(vehicle.vehicle_id) ? "marked" : ""} onClick={() => toggleConstraint(vehicle.vehicle_id, "excluded")}>Exclude</button>
         </article>)}</div></section>
       <aside className="side-stack">
-        <section className="panel"><p className="eyebrow">PLAY NOW</p><h2>Ready frontier</h2><Result value={state?.play_now} empty="Refresh to load the active recommendation." /></section>
-        <section className="panel"><p className="eyebrow">BUILDER</p><h2>Visible draft</h2><ol className="slots">{Array.from({ length: slots }, (_, index) => <li key={index}>{draft[index] ?? <em>Empty crew slot</em>}</li>)}</ol><p className="muted">Pins and exclusions are hard constraints. Suggestions never overwrite this draft.</p><Detail value={{ draft, required, excluded, target_br: targetBr }} /></section>
-        <section className="panel"><p className="eyebrow">COMPARE</p><h2>Alternative check</h2><button onClick={() => void mutate(async () => setComparison(await api.compare(profileId, { lineup_a: draft, lineup_b: playNowLineup.slice(0, slots) })), "Comparison refreshed.")} disabled={draft.length === 0}>Compare draft / play now</button>{comparison && <Result value={comparison} empty="" />}</section>
+        <section className="panel"><p className="eyebrow">PLAY NOW</p><h2>Ready frontier</h2><Result value={state?.play_now} empty="Refresh to load the active recommendation." vehicleName={vehicleName} /></section>
+        <section className="panel"><p className="eyebrow">BUILDER</p><h2>Visible draft</h2><ol className="slots">{Array.from({ length: slots }, (_, index) => <li key={index}>{draft[index] ? vehicleName(draft[index]) : <em>Empty crew slot</em>}</li>)}</ol><p className="muted">Pins and exclusions are hard constraints. Suggestions never overwrite this draft.</p><Detail value={{ draft, required, excluded, target_br: targetBr }} /></section>
+        <section className="panel"><p className="eyebrow">COMPARE</p><h2>Alternative check</h2><button onClick={() => void mutate(async () => setComparison(await api.compare(profileId, { lineup_a: draft, lineup_b: playNowLineup.slice(0, slots) })), "Comparison refreshed.")} disabled={draft.length === 0}>Compare draft / play now</button>{comparison && <Result value={comparison} empty="" vehicleName={vehicleName} />}</section>
       </aside>
     </div>
     <section className="lower-grid">
-      <section className="panel"><p className="eyebrow">PRESETS</p><h2>Saved lineup intent</h2><form onSubmit={(event) => void savePreset(event)} className="preset-form"><input required name="preset-name" maxLength={80} value={presetName} onChange={(event) => setPresetName(event.target.value)} placeholder="New preset name" aria-label="Preset name" /><button className="accent">{editingPreset ? "Save changes" : "Save draft"}</button>{editingPreset && <button type="button" onClick={() => { setEditingPreset(undefined); setPresetName(""); }}>Cancel edit</button>}</form><PresetList presets={state?.presets ?? []} profileId={profileId} selectedPresetId={typeof asRecord(state?.context).selected_preset_id === "string" ? asRecord(state?.context).selected_preset_id as string : undefined} onSelect={(preset) => void selectContext(preset.preset_id)} onLoad={(preset) => { setDraft(preset.slots); setRequired(preset.required_vehicle_ids ?? []); setExcluded(preset.excluded_vehicle_ids ?? []); setNotice(`Loaded ${preset.name}; apply or save explicitly.`); }} onEdit={(preset) => { setEditingPreset(preset); setPresetName(preset.name); setDraft(preset.slots); setRequired(preset.required_vehicle_ids ?? []); setExcluded(preset.excluded_vehicle_ids ?? []); setNotice(`Editing ${preset.name}; save explicitly to update it.`); }} onDelete={(preset) => void mutate(() => api.deletePreset(profileId, preset.preset_id, preset.revision), "Preset deleted.")} /></section>
-      <section className="panel"><p className="eyebrow">RESEARCH NEXT</p><h2>One-step unlock evidence</h2><Result value={state?.research_next} empty="No unlock evaluations are currently available." /></section>
-      <section className="panel"><p className="eyebrow">DATA HEALTH</p><h2>Evidence boundaries</h2><Result value={state?.evidence_health} empty="No evidence health data returned." /></section>
+      <section className="panel"><p className="eyebrow">PRESETS</p><h2>Saved lineup intent</h2><form onSubmit={(event) => void savePreset(event)} className="preset-form"><input required name="preset-name" maxLength={80} value={presetName} onChange={(event) => setPresetName(event.target.value)} placeholder="New preset name" aria-label="Preset name" /><button className="accent">{editingPreset ? "Save changes" : "Save draft"}</button>{editingPreset && <button type="button" onClick={() => { setEditingPreset(undefined); setPresetName(""); }}>Cancel edit</button>}</form><PresetList presets={state?.presets ?? []} profileId={profileId} selectedPresetId={typeof asRecord(state?.context).selected_preset_id === "string" ? asRecord(state?.context).selected_preset_id as string : undefined} vehicleName={vehicleName} onSelect={(preset) => void selectContext(preset.preset_id)} onLoad={(preset) => { setDraft(preset.slots); setRequired(preset.required_vehicle_ids ?? []); setExcluded(preset.excluded_vehicle_ids ?? []); setNotice(`Loaded ${preset.name}; apply or save explicitly.`); }} onEdit={(preset) => { setEditingPreset(preset); setPresetName(preset.name); setDraft(preset.slots); setRequired(preset.required_vehicle_ids ?? []); setExcluded(preset.excluded_vehicle_ids ?? []); setNotice(`Editing ${preset.name}; save explicitly to update it.`); }} onDelete={(preset) => void mutate(async () => { await api.deletePreset(profileId, preset.preset_id, preset.revision); setState((old) => old ? { ...old, presets: (old.presets ?? []).filter((item) => item.preset_id !== preset.preset_id) } : old); }, "Preset deleted.")} /></section>
+      <section className="panel"><p className="eyebrow">RESEARCH NEXT</p><h2>One-step unlock evidence</h2><Result value={state?.research_next} empty="No unlock evaluations are currently available." vehicleName={vehicleName} /></section>
+      <section className="panel"><p className="eyebrow">DATA HEALTH</p><h2>Evidence boundaries</h2><EvidenceHealth value={state?.evidence_health} />{communityRefresh && <><p>Community refresh: {communityRefresh.outcome}. Statistics: {communityRefresh.statistics_status ?? "unknown"}; {communityRefresh.accepted_statistics_rows ?? 0} accepted, {communityRefresh.quarantined_statistics_rows ?? 0} quarantined, {communityRefresh.eligible_statistics_rows ?? 0} scoring-eligible. Bundle: {communityRefresh.bundle_id ?? "unchanged"}.</p>{communityRefresh.source_observation_date && <p className="muted">Community statistics observed {communityRefresh.source_observation_date} ({communityRefresh.statistics_age_days ?? "?"} days old). {communityRefresh.statistics_limitations}</p>}</>}</section>
     </section>
   </main>;
 }
 
-function Result({ value, empty }: { value: unknown; empty: string }) {
-  if (!value || (Array.isArray(value) && value.length === 0)) return <p className="muted">{empty}</p>;
-  const record = asRecord(value as Json); const analysis = asRecord(record.analysis as Json); const readiness = analysis.readiness_passed ?? record.readiness_passed;
-  return <div className="result"><p>{typeof readiness === "boolean" && <strong className={readiness ? "ready" : "not-ready"}>{readiness ? "READY" : "NOT READY"}</strong>} {typeof analysis.lineup_br === "number" && <> BR {br(analysis.lineup_br)}</>}</p><p>{list(asRecord(analysis.lineup as Json).slots).join(" · ") || (typeof record.message === "string" ? record.message : "See details for returned evidence.")}</p><Detail value={value} /></div>;
+function EvidenceHealth({ value }: { value: unknown }) {
+  if (!value) return <p className="muted">No evidence health data returned.</p>;
+  const health = asRecord(value);
+  const components = asRecord(health.components);
+  const capabilities = asRecord(components.capabilities);
+  const statistics = asRecord(components.global_statistics);
+  const total = capabilities.total_count;
+  const complete = capabilities.field_complete_count;
+  return <div className="result">
+    {typeof total === "number" && typeof complete === "number" &&
+      <p>{complete} of {total} vehicles have complete scored capability evidence; {String(capabilities.missing_pair_count ?? "?")} vehicle/capability pairs remain unresolved.</p>}
+    <p>Statistics: {typeof statistics.status === "string" ? statistics.status : "unknown"}. {statistics.missing_reason === "no_compatible_statistics_snapshot" ? "No compatible operational statistics snapshot is selected." : "Coverage and provenance are in the details below."}</p>
+    <p>When evidence is missing, 50 is a neutral composite contribution, not an observed vehicle score or verified capability. Uptier resilience is a proxy; inspect its unknown inputs.</p>
+    <Detail value={value} />
+  </div>;
 }
 
-function PresetList({ presets, profileId, selectedPresetId, onSelect, onLoad, onEdit, onDelete }: { presets: Preset[]; profileId: string; selectedPresetId?: string; onSelect: (preset: Preset) => void; onLoad: (preset: Preset) => void; onEdit: (preset: Preset) => void; onDelete: (preset: Preset) => void }) {
+function Result({ value, empty, vehicleName }: { value: unknown; empty: string; vehicleName: (id: string) => string }) {
+  if (!value || (Array.isArray(value) && value.length === 0)) return <p className="muted">{empty}</p>;
+  const record = asRecord(value as Json);
+  const directAnalysis = asRecord(record.analysis);
+  const recommendedAnalysis = asRecord(asRecord(record.recommended).analysis);
+  const analysis = Object.keys(directAnalysis).length ? directAnalysis : Object.keys(recommendedAnalysis).length ? recommendedAnalysis : record;
+  const readiness = analysis.readiness_passed ?? record.readiness_passed;
+  return <div className="result"><p>{typeof readiness === "boolean" && <strong className={readiness ? "ready" : "not-ready"}>{readiness ? "READY" : "NOT READY"}</strong>} {typeof analysis.lineup_br === "number" && <> BR {br(analysis.lineup_br)}</>}</p><p>{list(asRecord(analysis.lineup as Json).slots).map(vehicleName).join(" · ") || (typeof record.message === "string" ? record.message : "See details for returned evidence.")}</p><StatisticsEvidence analysis={analysis} vehicleName={vehicleName} /><Detail value={value} /></div>;
+}
+
+function PresetList({ presets, profileId, selectedPresetId, vehicleName, onSelect, onLoad, onEdit, onDelete }: { presets: Preset[]; profileId: string; selectedPresetId?: string; vehicleName: (id: string) => string; onSelect: (preset: Preset) => void; onLoad: (preset: Preset) => void; onEdit: (preset: Preset) => void; onDelete: (preset: Preset) => void }) {
   if (!presets.length) return <p className="muted">No saved presets for {profileId}.</p>;
-  return <ul className="presets">{presets.map((preset) => <li key={preset.preset_id}><div><strong>{preset.name}</strong>{selectedPresetId === preset.preset_id && <small>Selected context</small>}<small>{preset.slots.join(" · ") || "Incomplete draft"}</small></div><button onClick={() => onSelect(preset)} disabled={selectedPresetId === preset.preset_id}>Select context</button><button onClick={() => onLoad(preset)}>Load</button><button onClick={() => onEdit(preset)}>Edit</button><button onClick={() => onDelete(preset)}>Delete</button></li>)}</ul>;
+  return <ul className="presets">{presets.map((preset) => <li key={preset.preset_id}><div><strong>{preset.name}</strong>{selectedPresetId === preset.preset_id && <small>Selected context</small>}<small>{preset.slots.map(vehicleName).join(" · ") || "Incomplete draft"}</small></div><button onClick={() => onSelect(preset)} disabled={selectedPresetId === preset.preset_id}>Select context</button><button onClick={() => onLoad(preset)}>Load</button><button onClick={() => onEdit(preset)}>Edit</button><button onClick={() => onDelete(preset)}>Delete</button></li>)}</ul>;
 }

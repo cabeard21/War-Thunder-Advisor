@@ -1,4 +1,4 @@
-import type { ApiError, DashboardState, Json, Preset, RecordValue } from "./types";
+import type { ApiError, CommunityRefreshResult, DashboardState, Json, Preset, RecordValue } from "./types";
 
 const base = "/api";
 
@@ -56,26 +56,51 @@ export async function request<T>(
 }
 
 export const api = {
+  refreshCommunityEvidence: () =>
+    request<CommunityRefreshResult>("/data/refresh-community", { method: "POST" }),
   dashboard: async (profileId: string): Promise<DashboardState> => {
-    const [progress, context, presets, vehicles, playNow, researchNext, evidenceHealth] = await Promise.all([
+    const results = await Promise.allSettled([
       request<RecordValue>(`/profiles/${encodeURIComponent(profileId)}/progress`),
       request<RecordValue>(`/profiles/${encodeURIComponent(profileId)}/context`),
       request<Preset[]>(`/profiles/${encodeURIComponent(profileId)}/presets`),
       request<RecordValue | Json[]>("/vehicles"),
-      request<RecordValue>("/evaluate", { method: "POST", body: JSON.stringify({ profile_id: profileId }) }),
-      request<RecordValue | Json[]>(`/profiles/${encodeURIComponent(profileId)}/unlock-evaluations`),
-      request<RecordValue>("/data-status"),
     ]);
+    const labels = ["garage", "context", "presets", "vehicles"];
+    const load_errors = results.flatMap((result, index) => result.status === "rejected"
+      ? [`Unable to load ${labels[index]}: ${result.reason instanceof Error ? result.reason.message : "request failed"}`]
+      : []);
+    const value = (index: number): unknown => results[index].status === "fulfilled"
+      ? results[index].value : undefined;
+    const progress = (value(0) ?? {}) as RecordValue;
+    const context = (value(1) ?? {}) as RecordValue;
+    const presets = (value(2) ?? []) as Preset[];
+    const vehicles = value(3) as RecordValue | Json[] | undefined ?? [];
     const statusByVehicle = (progress.vehicle_statuses ?? {}) as Record<string, string>;
     const catalog = Array.isArray(vehicles) ? vehicles : (vehicles.vehicles ?? []);
     return {
+      load_errors,
       profile: (progress.profile ?? progress) as RecordValue,
       context: context as unknown as DashboardState["context"],
       presets,
       vehicles: (catalog as unknown as import("./types").Vehicle[]).map((vehicle) => ({ ...vehicle, status: statusByVehicle[vehicle.vehicle_id] ?? vehicle.status })),
-      play_now: playNow,
-      research_next: researchNext,
-      evidence_health: evidenceHealth,
+    };
+  },
+  dashboardInsights: async (profileId: string): Promise<DashboardState> => {
+    const results = await Promise.allSettled([
+      request<RecordValue>("/evaluate", { method: "POST", body: JSON.stringify({ profile_id: profileId }) }),
+      request<RecordValue | Json[]>(`/profiles/${encodeURIComponent(profileId)}/unlock-evaluations`),
+      request<RecordValue>("/data-status"),
+    ]);
+    const labels = ["recommendation", "research", "data health"];
+    const load_errors = results.flatMap((result, index) => result.status === "rejected"
+      ? [`Unable to load ${labels[index]}: ${result.reason instanceof Error ? result.reason.message : "request failed"}`]
+      : []);
+    const value = (index: number): unknown => results[index].status === "fulfilled" ? results[index].value : undefined;
+    return {
+      load_errors,
+      play_now: value(0) as RecordValue | undefined,
+      research_next: value(1) as RecordValue | Json[] | undefined,
+      evidence_health: value(2) as RecordValue | undefined,
     };
   },
   garage: (profileId: string) => request<RecordValue>(`/profiles/${encodeURIComponent(profileId)}/progress`),

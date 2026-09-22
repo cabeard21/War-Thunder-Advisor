@@ -7,7 +7,8 @@ export default defineConfig({
   plugins: [react()],
   build: {
     outDir: "../src/wt_advisor/web/static",
-    emptyOutDir: true,
+    // Retain previously built, potentially user-owned assets in a dirty worktree.
+    emptyOutDir: false,
   },
   test: {
     environment: "jsdom",
