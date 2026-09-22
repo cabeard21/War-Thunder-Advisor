@@ -1,0 +1,12 @@
+[
+  {
+    "vehicle_id": "us_m3_lee",
+    "capability": "scouting",
+    "value": false,
+    "source_provider": "synthetic_example_not_game_evidence",
+    "source_reference": "example:replace-with-verifiable-source",
+    "source_type": "curated_import",
+    "verified_at": "2026-09-21",
+    "source_revision": "synthetic-example-v1"
+  }
+]

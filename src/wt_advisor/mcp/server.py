@@ -29,6 +29,12 @@ MUTATION = ToolAnnotations(
     idempotent_hint=True,
     open_world_hint=False,
 )
+REFRESH_MUTATION = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=True,
+    idempotent_hint=True,
+    open_world_hint=True,
+)
 
 
 BR_TENTHS_DESCRIPTION = (
@@ -76,6 +82,12 @@ def create_server(service: AdvisorService) -> MCPServer[Any]:
 
         return _dump(service.data_status())
 
+    @server.tool(annotations=REFRESH_MUTATION, structured_output=True)
+    def refresh_community_evidence() -> dict[str, Any]:
+        """Fetch bounded community sources and atomically publish valid new evidence."""
+
+        return _dump(service.refresh_community_evidence())
+
     @server.tool(annotations=READ_ONLY, structured_output=True)
     def list_vehicles(
         nation: Nation = Nation.USA,
@@ -98,10 +110,9 @@ def create_server(service: AdvisorService) -> MCPServer[Any]:
 
     @server.tool(annotations=READ_ONLY, structured_output=True)
     def get_vehicle_statistics(vehicle_id: str) -> list[dict[str, Any]]:
-        """Return every source statistics scope available for a vehicle."""
+        """Return source scopes with current scoring eligibility and proxy use."""
 
-        statistics = service.get_vehicle_statistics(vehicle_id)
-        return [_dump(item) for item in statistics]
+        return service.vehicle_statistics_status(vehicle_id)
 
     @server.tool(annotations=READ_ONLY, structured_output=True)
     def get_user_progress(profile_id: str = "acceptance") -> dict[str, Any]:

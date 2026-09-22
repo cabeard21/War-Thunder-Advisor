@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from copy import copy
 from datetime import UTC, date, datetime
+from hashlib import sha256
 from itertools import combinations
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import httpx
+
 from wt_advisor.data.freshness import evaluate_freshness
+from wt_advisor.data.imports.capabilities import (
+    MAX_CAPABILITY_IMPORT_BYTES,
+    import_capabilities_json,
+)
 from wt_advisor.data.imports.statistics import (
     MAX_IMPORT_BYTES,
     import_statistics_csv,
@@ -19,7 +27,18 @@ from wt_advisor.data.imports.statistics import (
     inspect_statistics_csv,
     inspect_statistics_json,
 )
-from wt_advisor.data.models import RawDatasetMetadata, canonical_bytes
+from wt_advisor.data.models import (
+    RawDatasetMetadata,
+    RawResearchGraphDataset,
+    RawVehicleRecord,
+    canonical_bytes,
+)
+from wt_advisor.data.providers.community_statistics import (
+    PROVIDER as COMMUNITY_STATISTICS_PROVIDER,
+)
+from wt_advisor.data.providers.community_statistics import (
+    CommunityStatisticsProvider,
+)
 from wt_advisor.data.providers.fixture import FixtureProvider
 from wt_advisor.data.providers.wt_vehicles_api import WarThunderVehiclesApiProvider
 from wt_advisor.domain.models import (
@@ -32,6 +51,7 @@ from wt_advisor.domain.models import (
     CapabilityObservation,
     CapabilityResolution,
     CapabilitySourceType,
+    CapabilityState,
     DatasetType,
     EvidenceContext,
     Freshness,
@@ -42,6 +62,7 @@ from wt_advisor.domain.models import (
     LineupComparison,
     Nation,
     PrerequisiteSemantics,
+    RatioProvenance,
     ReconciliationResult,
     Researchability,
     ResearchDomain,
@@ -73,12 +94,23 @@ from wt_advisor.rules import (
     evaluate_lineup_rules,
     infer_roles,
     load_ruleset,
+    statistics_eligibility,
 )
 from wt_advisor.storage import EvidenceRepository, create_database
 from wt_advisor.storage.repository import ResolvedAnalysisBundle, SnapshotCompatibility
 
 MAX_COMBINATIONS = 500_000
 FROZEN_ACCEPTANCE_AS_OF = date(2026, 9, 19)
+SCORED_CAPABILITIES = (
+    Capability.SCOUTING,
+    Capability.STABILIZER,
+    Capability.VERTICAL_STABILIZER,
+    Capability.SMOKE,
+    Capability.ARTILLERY,
+    Capability.HIGH_CALIBER_HE,
+    Capability.ATGM,
+)
+MAX_COVERAGE_GAPS = 100
 
 
 class AdvisorService:
@@ -415,14 +447,15 @@ class AdvisorService:
                 )
             )
         )
+        capability_snapshots = repository.list_compatible_capability_snapshots(vehicle_snapshot)
         capability_resolutions = (
             {}
-            if resolution.capability_snapshot is None
+            if not capability_snapshots
             else {
                 vehicle.vehicle_id: tuple(
                     repository.resolve_capabilities(
                         vehicle.vehicle_id,
-                        snapshot_id=resolution.capability_snapshot.snapshot_id,
+                        snapshot_ids=tuple(item.snapshot_id for item in capability_snapshots),
                     ).values()
                 )
                 for vehicle in vehicles
@@ -454,7 +487,7 @@ class AdvisorService:
             _refresh_snapshot(snapshot, as_of=date.today())
             for snapshot in (
                 vehicle_snapshot,
-                resolution.capability_snapshot,
+                *capability_snapshots,
                 resolution.availability_snapshot,
                 resolution.identity_snapshot,
                 resolution.research_graph_snapshot,
@@ -477,7 +510,7 @@ class AdvisorService:
                 snapshots=active_snapshots,
                 override_revision=overrides.revision,
                 ruleset_hash=ruleset.content_hash,
-                schema_revision="0005",
+                schema_revision="0006",
             ),
             resolved_availability=resolved_availability,
             capability_resolutions=capability_resolutions,
@@ -554,6 +587,11 @@ class AdvisorService:
             if self._bundle_resolution is None
             else self._bundle_resolution.capability_snapshot
         )
+        capability_snapshot_ids = [
+            snapshot.snapshot_id
+            for snapshot in self._evidence_context.snapshots
+            if snapshot.dataset_type is DatasetType.CAPABILITIES
+        ]
         availability_snapshot = (
             _snapshot_of_type(self._evidence_context, DatasetType.AVAILABILITY)
             if self._bundle_resolution is None
@@ -628,6 +666,48 @@ class AdvisorService:
                 as_of=self._evaluation_date,
             ),
         }
+        priority_ids = self._priority_vehicle_ids()
+        catalog_coverage = self._capability_coverage(tuple(sorted(self._vehicles)))
+        profile_coverage = self._capability_coverage(priority_ids)
+        unavailable_reason = (
+            "incompatible_snapshot"
+            if statistics_snapshot is None and newest_statistics is not None
+            and compatibility.status == "incompatible"
+            else "absent_source"
+        )
+        statistics_catalog = self._statistics_coverage(
+            tuple(sorted(self._vehicles)), unavailable_reason=unavailable_reason
+        )
+        statistics_profile = self._statistics_coverage(
+            priority_ids, unavailable_reason=unavailable_reason
+        )
+        components[DatasetType.CAPABILITIES.value].update(
+            {
+                "selected_snapshot_ids": capability_snapshot_ids,
+                "field_coverage": catalog_coverage["field_coverage"],
+                "field_complete_count": catalog_coverage["field_complete_count"],
+                "missing_pair_count": catalog_coverage["missing_pair_count"],
+                "missing_pairs": catalog_coverage["missing_pairs"],
+                "missing_pairs_truncated": catalog_coverage["missing_pairs_truncated"],
+            }
+        )
+        statistics_gaps = [
+            vehicle_id
+            for vehicle_id in sorted(self._vehicles)
+            if vehicle_id not in self._statistics
+        ]
+        components[DatasetType.GLOBAL_STATISTICS.value].update(
+            {
+                "missing_vehicle_count": len(statistics_gaps),
+                "missing_vehicle_ids": statistics_gaps[:MAX_COVERAGE_GAPS],
+                "missing_vehicle_ids_truncated": len(statistics_gaps) > MAX_COVERAGE_GAPS,
+                "missing_reason": (
+                    "no_compatible_statistics_snapshot"
+                    if statistics_snapshot is None
+                    else "vehicle_row_not_in_selected_snapshot"
+                ),
+            }
+        )
         active_component_ids = {
             name: item["selected_snapshot_id"]
             for name, item in components.items()
@@ -653,10 +733,19 @@ class AdvisorService:
                 "missing_vehicle_ids": list(compatibility.missing_vehicle_ids),
             },
             "components": components,
+            "capability_coverage": {
+                "catalog": catalog_coverage,
+                "profile": {"scope": "owned_and_immediate_research", **profile_coverage},
+            },
+            "statistics_coverage": {
+                "catalog": statistics_catalog,
+                "profile": {"scope": "owned_and_immediate_research", **statistics_profile},
+            },
             "active": {
                 "bundle_id": stable_hash(
                     {
                         "component_snapshot_ids": active_component_ids,
+                        "capability_snapshot_ids": capability_snapshot_ids,
                         "override_revision": self._evidence_context.override_revision,
                         "ruleset_hash": self._evidence_context.ruleset_hash,
                     }
@@ -671,6 +760,11 @@ class AdvisorService:
                 "statistics_snapshot_id": statistics_snapshot_id,
                 "statistics_status": (
                     "available" if statistics_snapshot is not None else "unavailable"
+                ),
+                "statistics_scoring_status": (
+                    "community_rb_proxy" if statistics_catalog["proxy_vehicle_count"] > 0
+                    else "eligible" if statistics_catalog["eligible_vehicle_count"] > 0
+                    else "context_only" if statistics_snapshot is not None else "unavailable"
                 ),
                 "statistics_period": {
                     "start": (
@@ -691,6 +785,7 @@ class AdvisorService:
                 "capability_snapshot_id": (
                     None if capability_snapshot is None else capability_snapshot.snapshot_id
                 ),
+                "capability_snapshot_ids": capability_snapshot_ids,
                 "availability_snapshot_id": (
                     None if availability_snapshot is None else availability_snapshot.snapshot_id
                 ),
@@ -702,6 +797,138 @@ class AdvisorService:
                 ),
                 "warnings": list(self._service_warnings),
             },
+        }
+
+    def _priority_vehicle_ids(self) -> tuple[str, ...]:
+        owned = {
+            vehicle_id for vehicle_id, status in self._statuses.items()
+            if status is VehicleStatus.OWNED and vehicle_id in self._vehicles
+        }
+        active_research = {
+            vehicle_id for vehicle_id, status in self._statuses.items()
+            if status in {VehicleStatus.RESEARCHING, VehicleStatus.AVAILABLE_TO_RESEARCH}
+            and vehicle_id in self._vehicles
+        }
+        immediate = {
+            _research_edge_parts(edge)[1]
+            for edge in self._research_edges
+            if _research_edge_parts(edge)[0] in owned
+        }
+        return tuple(sorted(owned | active_research | (immediate & self._vehicles.keys())))
+
+    def _capability_coverage(self, vehicle_ids: Sequence[str]) -> dict[str, Any]:
+        states_by_vehicle = {
+            vehicle_id: {
+                resolution.capability: resolution.state
+                for resolution in self._capability_resolutions.get(vehicle_id, ())
+            }
+            for vehicle_id in vehicle_ids
+        }
+        field_coverage: dict[str, dict[str, int]] = {}
+        missing_pairs: list[dict[str, str]] = []
+        complete = 0
+        for capability in SCORED_CAPABILITIES:
+            counts = {state.value: 0 for state in CapabilityState}
+            for vehicle_id in vehicle_ids:
+                state = states_by_vehicle[vehicle_id].get(capability, CapabilityState.UNKNOWN)
+                counts[state.value] += 1
+                if state in {CapabilityState.UNKNOWN, CapabilityState.CONFLICTED}:
+                    missing_pairs.append({
+                        "vehicle_id": vehicle_id,
+                        "capability": capability.value,
+                        "reason": (
+                            "conflicting_observations"
+                            if state is CapabilityState.CONFLICTED
+                            else "no_selected_observation"
+                        ),
+                    })
+            field_coverage[capability.value] = {"denominator": len(vehicle_ids), **counts}
+        for states in states_by_vehicle.values():
+            if all(
+                states.get(capability, CapabilityState.UNKNOWN)
+                in {CapabilityState.PRESENT, CapabilityState.VERIFIED_ABSENT}
+                for capability in SCORED_CAPABILITIES
+            ):
+                complete += 1
+        return {
+            "vehicle_count": len(vehicle_ids),
+            "field_complete_count": complete,
+            "field_coverage": field_coverage,
+            "missing_pair_count": len(missing_pairs),
+            "missing_pairs": missing_pairs[:MAX_COVERAGE_GAPS],
+            "missing_pairs_truncated": len(missing_pairs) > MAX_COVERAGE_GAPS,
+        }
+
+    def _statistics_coverage(
+        self, vehicle_ids: Sequence[str], *, unavailable_reason: str
+    ) -> dict[str, Any]:
+        reasons: dict[str, int] = defaultdict(int)
+        details: list[dict[str, str]] = []
+        metric_names = ("win_rate", "kd", "kills_per_battle")
+        selected = self._scoring_statistics()
+        peers = self._peer_statistics()
+        eligible_count = 0
+        proxy_count = 0
+        has_selected = any(
+            snapshot.dataset_type is DatasetType.GLOBAL_STATISTICS
+            for snapshot in self._evidence_context.snapshots
+        )
+        for vehicle_id in vehicle_ids:
+            rows = self._statistics.get(vehicle_id, ())
+            stats = selected.get(vehicle_id)
+            exclusion: str | None = None
+            usable: tuple[str, ...] = ()
+            if stats is not None and has_selected:
+                if self._synthetic_proxy(stats):
+                    exclusion = "synthetic_acceptance_fixture"
+                else:
+                    exclusion, usable, _, _ = statistics_eligibility(
+                        self._vehicles[vehicle_id], self._battle_ratings[vehicle_id], stats,
+                        peers, as_of=self._evaluation_date, ruleset=self._ruleset,
+                    )
+                if exclusion is None:
+                    eligible_count += 1
+                    if stats.mode_scope is StatisticsScope.REALISTIC_ALL_CONTEXTS:
+                        proxy_count += 1
+            for metric in metric_names:
+                if not has_selected:
+                    reason = unavailable_reason
+                elif stats is None:
+                    reason = "missing_vehicle_row" if not rows else "wrong_mode"
+                elif exclusion is not None:
+                    reason = (
+                        "missing_sample_metadata"
+                        if exclusion == "nonpositive_battles"
+                        and stats.battles is None
+                        and stats.ratio_source(metric) is RatioProvenance.REPORTED
+                        else exclusion
+                    )
+                elif metric in usable:
+                    reason = (
+                        "usable_reported_metric"
+                        if stats.mode_scope is StatisticsScope.REALISTIC_ALL_CONTEXTS
+                        else "usable_count_metric"
+                    )
+                else:
+                    reason = (
+                        "insufficient_compatible_peers"
+                        if stats.ratio_source(metric) is not RatioProvenance.UNAVAILABLE
+                        else "missing_metric"
+                    )
+                reasons[reason] += 1
+                if reason not in ("usable_count_metric", "usable_reported_metric"):
+                    details.append({
+                        "vehicle_id": vehicle_id, "metric": metric, "reason": reason,
+                    })
+        return {
+            "vehicle_count": len(vehicle_ids),
+            "eligible_vehicle_count": eligible_count,
+            "proxy_vehicle_count": proxy_count,
+            "metric_denominator": len(vehicle_ids) * len(metric_names),
+            "reason_counts": dict(sorted(reasons.items())),
+            "gaps": details[:MAX_COVERAGE_GAPS],
+            "gap_count": len(details),
+            "gaps_truncated": len(details) > MAX_COVERAGE_GAPS,
         }
 
     def list_vehicles(
@@ -739,6 +966,33 @@ class AdvisorService:
         self._require_vehicle(vehicle_id)
         return self._statistics.get(vehicle_id, ())
 
+    def vehicle_statistics_status(self, vehicle_id: str) -> list[dict[str, Any]]:
+        """Return source observations with current scoring eligibility diagnostics."""
+        rows = self.get_vehicle_statistics(vehicle_id)
+        selected = self._scoring_statistics().get(vehicle_id)
+        snapshots = {
+            item.snapshot_id: item for item in self._evidence_context.snapshots
+        }
+        details = []
+        for row in rows:
+            reason = self._statistics_eligibility(vehicle_id, row)
+            if reason is None and row != selected:
+                reason = "superseded_by_verified_ground_rb"
+            proxy = row.mode_scope is StatisticsScope.REALISTIC_ALL_CONTEXTS
+            snapshot = snapshots.get(row.snapshot_id)
+            details.append(row.model_dump(mode="json") | {
+                "eligible": reason is None,
+                "proxy_used": proxy and reason is None,
+                "evidence_label": (
+                    "Community RB ground-vehicle proxy" if proxy
+                    else "Verified Ground RB statistics"
+                ),
+                "source_scope": row.mode_scope.value,
+                "source_provider": None if snapshot is None else snapshot.provider,
+                "exclusion_reason": reason,
+            })
+        return details
+
     def import_live_vehicles(self) -> SnapshotRef:
         """Persist bounded live metadata, capability, and prerequisite evidence."""
 
@@ -762,6 +1016,319 @@ class AdvisorService:
             raw_content=bundle.research_graph.raw_content,
         )
         return bundle.vehicles.snapshot
+
+    def reprocess_retained_community_statistics(self) -> dict[str, Any]:
+        """Normalize retained joined CSV against the active vehicle catalog, offline."""
+
+        if self._repository is None or self._bundle_resolution is None:
+            raise ValueError("retained community statistics require a database-backed service")
+        vehicle_snapshot = self._bundle_resolution.vehicle_snapshot
+        if vehicle_snapshot.purpose is not SnapshotPurpose.OPERATIONAL:
+            raise ValueError("retained community statistics require operational vehicle evidence")
+        sources = (
+            snapshot
+            for snapshot in self._repository.list_snapshots(DatasetType.GLOBAL_STATISTICS)
+            if snapshot.provider == COMMUNITY_STATISTICS_PROVIDER
+            and snapshot.sample_end is not None
+            and self._repository.raw_artifact_content(snapshot.snapshot_id) is not None
+        )
+        candidates = tuple(sources)
+        latest_date = max(
+            (item.sample_end for item in candidates if item.sample_end is not None),
+            default=None,
+        )
+        # A normalized successor retains the original CSV and source date. Keep
+        # the first captured artifact as the stable input on every repeat run.
+        source = min(
+            (item for item in candidates if item.sample_end == latest_date),
+            key=lambda item: (item.retrieved_at, item.snapshot_id),
+            default=None,
+        )
+        if source is None:
+            raise ValueError("no retained community statistics artifact is available")
+        retained = self._repository.raw_artifact_content(source.snapshot_id)
+        if retained is None:
+            raise ValueError("retained community statistics artifact is unavailable")
+        before = self.data_status()
+        result = CommunityStatisticsProvider().fetch_statistics(
+            identity_aliases=self._statistics_identity_aliases(COMMUNITY_STATISTICS_PROVIDER),
+            canonical_vehicle_ids=self._vehicles.keys(),
+            compatibility_key=vehicle_snapshot.compatibility_key,
+            retained_content=retained,
+            observation_date=source.sample_end,
+            source_revision=source.source_revision,
+        )
+        if result.dataset is None:
+            raise ValueError("retained community statistics have no accepted records")
+        imported = self._repository.import_statistics_dataset(result.dataset)
+        database_path = self._repository.engine.url.database
+        if not database_path:
+            raise ValueError("database path is unavailable after reprocess")
+        reloaded = type(self).from_database(database_path)
+        selected = reloaded.data_status()["active"]["statistics_snapshot_id"]
+        if selected != result.dataset.snapshot.snapshot_id:
+            raise RuntimeError("reprocessed statistics were stored but not selected")
+        self.__dict__ = reloaded.__dict__
+        return {
+            "outcome": "updated" if imported.created else "unchanged",
+            "previous_bundle_id": before["active"]["bundle_id"],
+            "bundle_id": self.data_status()["active"]["bundle_id"],
+            "source_snapshot_id": source.snapshot_id,
+            "statistics_snapshot_id": selected,
+            "accepted_statistics_rows": result.accepted_count,
+            "quarantined_statistics_rows": sum(result.quarantine_counts.values()),
+            "quarantine_reasons": result.quarantine_counts,
+            "before_coverage": before["statistics_coverage"],
+            "after_coverage": self.data_status()["statistics_coverage"],
+        }
+
+    def refresh_community_evidence(self) -> dict[str, Any]:
+        """Fetch and atomically publish bounded community evidence for new evaluations."""
+
+        before = self.data_status()
+        previous_bundle_id = before["active"]["bundle_id"]
+        result: dict[str, Any] = {
+            "outcome": "failed",
+            "previous_bundle_id": previous_bundle_id,
+            "bundle_id": previous_bundle_id,
+            "accepted_statistics_rows": 0,
+            "quarantined_statistics_rows": 0,
+            "quarantine_reasons": {},
+            "statistics_status": "unavailable",
+            "before_coverage": before["capability_coverage"],
+            "after_coverage": before["capability_coverage"],
+            "message": "Existing evidence was retained.",
+        }
+        if self._repository is None:
+            return {**result, "message": "Community refresh requires a database-backed service."}
+
+        published = False
+        try:
+            vehicle_bundle = WarThunderVehiclesApiProvider().fetch_operational_components(
+                max_br=143,
+                max_details=25,
+                priority_vehicle_ids=self._priority_vehicle_ids(),
+                previously_fetched_ids=self._previously_fetched_detail_ids(),
+            )
+            canonical_ids = {row.vehicle_id for row in vehicle_bundle.vehicles.records}
+            aliases = {
+                row.source_vehicle_id: row.vehicle_id
+                for row in vehicle_bundle.vehicles.records
+            }
+            confirmed = self._statistics_identity_aliases(COMMUNITY_STATISTICS_PROVIDER)
+            retained_aliases = {
+                alias: vehicle_id
+                for alias, vehicle_id in confirmed.items()
+                if vehicle_id in canonical_ids and alias not in aliases
+            }
+            aliases = {**retained_aliases, **aliases}
+            aliases = {
+                **aliases,
+                **_joined_community_aliases(vehicle_bundle.vehicles.records, aliases),
+            }
+            statistics_result = None
+            statistics_error = None
+            try:
+                statistics_result = CommunityStatisticsProvider().fetch_statistics(
+                    identity_aliases=aliases,
+                    canonical_vehicle_ids=canonical_ids,
+                    compatibility_key=vehicle_bundle.vehicles.snapshot.compatibility_key,
+                )
+            except (ValueError, OSError) as error:
+                statistics_error = type(error).__name__
+
+            graph: RawResearchGraphDataset | None = vehicle_bundle.research_graph
+            previous_graph = (
+                None if self._bundle_resolution is None
+                else self._bundle_resolution.research_graph_snapshot
+            )
+            if previous_graph is not None and self._repository.component_compatibility(
+                vehicle_bundle.vehicles.snapshot, previous_graph
+            ).compatible:
+                prior_edges = {
+                    (edge.parent_vehicle_id, edge.child_vehicle_id)
+                    for edge in self._research_edges
+                }
+                new_edges = {
+                    (edge.parent_vehicle_id, edge.child_vehicle_id)
+                    for edge in vehicle_bundle.research_graph.records
+                }
+                if not prior_edges.issubset(new_edges):
+                    graph = None
+            self._repository.import_operational_bundle(
+                vehicles=vehicle_bundle.vehicles,
+                capabilities=vehicle_bundle.capabilities,
+                availability=vehicle_bundle.availability,
+                research_graph=graph,
+                statistics=(
+                    None if statistics_result is None else statistics_result.dataset
+                ),
+            )
+            published = True
+            database_path = self._repository.engine.url.database
+            if not database_path:
+                raise ValueError("database path is unavailable after refresh")
+            reloaded = type(self).from_database(database_path)
+        except (httpx.HTTPError, ValueError, OSError, RuntimeError) as error:
+            if published:
+                return {
+                    **result,
+                    "outcome": "restart_required",
+                    "bundle_id": None,
+                    "message": (
+                        "Evidence was published, but the service could not reload it; "
+                        "restart the service."
+                    ),
+                }
+            reason = (
+                "source rate limited"
+                if isinstance(error, httpx.HTTPStatusError)
+                and error.response.status_code == 429
+                else type(error).__name__
+            )
+            message = f"Refresh failed ({reason}); existing evidence was retained."
+            return {**result, "message": message}
+
+        # Swap the service view in one assignment so all three interfaces use the
+        # newly selected bundle without requiring a dashboard/MCP restart.
+        self.__dict__ = reloaded.__dict__
+        after = self.data_status()
+        accepted = 0 if statistics_result is None else statistics_result.accepted_count
+        reasons = {} if statistics_result is None else statistics_result.quarantine_counts
+        eligible_proxy = after["statistics_coverage"]["catalog"]["proxy_vehicle_count"]
+        statistics_status = (
+            "source_unavailable" if statistics_error is not None else
+            "community_rb_proxy" if eligible_proxy else
+            "context_only" if statistics_result is not None and accepted else
+            "no_usable_rows"
+        )
+        return {
+            **result,
+            "outcome": (
+                "unchanged" if after["active"]["bundle_id"] == previous_bundle_id
+                else "updated"
+            ),
+            "bundle_id": after["active"]["bundle_id"],
+            "accepted_statistics_rows": accepted,
+            "quarantined_statistics_rows": sum(reasons.values()),
+            "quarantine_reasons": reasons,
+            "statistics_status": statistics_status,
+            "eligible_statistics_rows": eligible_proxy,
+            "statistics_source_url": (
+                None if statistics_result is None else statistics_result.source_url
+            ),
+            "statistics_source_revision": (
+                None if statistics_result is None else statistics_result.source_revision
+            ),
+            "statistics_age_days": (
+                None if statistics_result is None else statistics_result.age_days
+            ),
+            "statistics_limitations": (
+                None if statistics_result is None else statistics_result.reason
+            ),
+            "source_observation_date": (
+                None if statistics_result is None
+                else statistics_result.observation_date.isoformat()
+            ),
+            "after_coverage": after["capability_coverage"],
+            "message": (
+                "Vehicle evidence refreshed; eligible community RB proxies are available."
+                if eligible_proxy else
+                "Vehicle evidence refreshed; community RB statistics remain context only."
+                if statistics_error is None else
+                "Vehicle evidence refreshed; statistics source was unavailable."
+            ),
+        }
+
+    def _previously_fetched_detail_ids(self) -> tuple[str, ...]:
+        if self._repository is None:
+            return ()
+        source_to_canonical = {
+            vehicle.source_vehicle_id: vehicle.vehicle_id
+            for vehicle in self._vehicles.values()
+        }
+        fetched: set[str] = set()
+        for snapshot in self._evidence_context.snapshots:
+            if (
+                snapshot.dataset_type is not DatasetType.CAPABILITIES
+                or snapshot.provider != "war_thunder_vehicles_community_api"
+            ):
+                continue
+            raw = self._repository.raw_artifact_content(snapshot.snapshot_id)
+            if raw is None:
+                continue
+            try:
+                rows = json.loads(raw)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(rows, list):
+                continue
+            fetched.update(
+                source_to_canonical[source_id]
+                for row in rows
+                if isinstance(row, dict)
+                and isinstance((source_id := row.get("identifier")), str)
+                and source_id in source_to_canonical
+            )
+        return tuple(sorted(fetched))
+
+    def import_capabilities(
+        self,
+        source: Path,
+        *,
+        provider: str,
+        source_revision: str,
+        vehicle_snapshot_id: str,
+    ) -> SnapshotRef:
+        """Import provenance-stamped curated observations for the selected vehicle scope."""
+
+        if self._repository is None:
+            raise ValueError("capability import requires a database-backed service")
+        if not provider.strip() or not source_revision.strip():
+            raise ValueError("provider and source revision are required")
+        selected = self._bundle_resolution
+        if selected is None or selected.vehicle_snapshot.snapshot_id != vehicle_snapshot_id:
+            raise ValueError("vehicle snapshot ID does not match the selected bundle")
+        current_snapshot_id = (
+            self._repository.resolve_analysis_bundle().vehicle_snapshot.snapshot_id
+        )
+        if current_snapshot_id != vehicle_snapshot_id:
+            raise ValueError("vehicle evidence changed; reload before importing capabilities")
+        if selected.vehicle_snapshot.purpose is not SnapshotPurpose.OPERATIONAL:
+            raise ValueError("curated operational capabilities require operational vehicles")
+        payload = _read_bounded_file(source, MAX_CAPABILITY_IMPORT_BYTES, kind="capability")
+        snapshot_id = "capabilities-curated-" + sha256(
+            provider.encode() + b"\0" + source_revision.encode() + b"\0" + payload
+        ).hexdigest()[:16]
+        metadata = RawDatasetMetadata(
+            snapshot_id=snapshot_id,
+            dataset_type=DatasetType.CAPABILITIES,
+            provider=provider,
+            source_revision=source_revision,
+            retrieved_at=datetime.now(UTC),
+            purpose=SnapshotPurpose.OPERATIONAL,
+            compatibility_key=selected.vehicle_snapshot.compatibility_key,
+        )
+        dataset = import_capabilities_json(payload, metadata)
+        unknown = sorted({row.vehicle_id for row in dataset.records} - self._vehicles.keys())
+        if unknown:
+            raise ValueError(
+                "capability import contains unknown canonical IDs: " + ", ".join(unknown)
+            )
+        if any(
+            row.source_type is not CapabilitySourceType.CURATED_IMPORT
+            for row in dataset.records
+        ):
+            raise ValueError("local capability import requires source_type curated_import")
+        if any(
+            row.source_provider != provider or row.source_revision != source_revision
+            for row in dataset.records
+        ):
+            raise ValueError("capability record provider/revision differs from import metadata")
+        self._repository.import_capability_snapshot(
+            dataset.snapshot, dataset.records, raw_content=dataset.raw_content
+        )
+        return dataset.snapshot
 
     def inspect_statistics(
         self,
@@ -890,6 +1457,11 @@ class AdvisorService:
                     snapshot_id=self._bundle_resolution.identity_snapshot.snapshot_id,
                     provider=provider,
                 ),
+            }
+        if provider == COMMUNITY_STATISTICS_PROVIDER:
+            aliases = {
+                **aliases,
+                **_joined_community_aliases(self._vehicles.values(), aliases),
             }
         return aliases
 
@@ -1311,6 +1883,13 @@ class AdvisorService:
             nearby_spaa=nearby_spaa,
             capability_resolutions=capability_evidence,
             ruleset=self._ruleset,
+            evaluation_date=self._evaluation_date,
+            source_providers={
+                item.snapshot_id: item.provider for item in self._evidence_context.snapshots
+            },
+            source_purposes={
+                item.snapshot_id: item.purpose.value for item in self._evidence_context.snapshots
+            },
         )
         warnings = tuple(
             dict.fromkeys(
@@ -1688,16 +2267,47 @@ class AdvisorService:
             )
             for vehicle_id, observations in self._statistics.items()
             for statistics in observations
-            if statistics.mode_scope is StatisticsScope.GROUND_REALISTIC_GROUND_VEHICLES
+            if statistics.mode_scope in (
+                StatisticsScope.GROUND_REALISTIC_GROUND_VEHICLES,
+                StatisticsScope.REALISTIC_ALL_CONTEXTS,
+            )
+            and not self._synthetic_proxy(statistics)
         )
 
+    def _synthetic_proxy(self, statistics: VehicleStatistics) -> bool:
+        return statistics.mode_scope is StatisticsScope.REALISTIC_ALL_CONTEXTS and any(
+            snapshot.snapshot_id == statistics.snapshot_id
+            and snapshot.purpose is SnapshotPurpose.ACCEPTANCE
+            for snapshot in self._evidence_context.snapshots
+        )
+
+    def _statistics_eligibility(self, vehicle_id: str, statistics: VehicleStatistics) -> str | None:
+        if self._synthetic_proxy(statistics):
+            return "synthetic_acceptance_fixture"
+        reason, _, _, _ = statistics_eligibility(
+            self._vehicles[vehicle_id], self._battle_ratings[vehicle_id], statistics,
+            self._peer_statistics(), as_of=self._evaluation_date, ruleset=self._ruleset,
+        )
+        return reason
+
     def _scoring_statistics(self) -> dict[str, VehicleStatistics]:
-        return {
-            vehicle_id: statistics
-            for vehicle_id, observations in self._statistics.items()
-            for statistics in observations
-            if statistics.mode_scope is StatisticsScope.GROUND_REALISTIC_GROUND_VEHICLES
-        }
+        chosen: dict[str, VehicleStatistics] = {}
+        for vehicle_id, observations in self._statistics.items():
+            candidates = sorted(
+                observations,
+                key=lambda item: (
+                    item.mode_scope is not StatisticsScope.GROUND_REALISTIC_GROUND_VEHICLES,
+                    item.snapshot_id,
+                ),
+            )
+            chosen[vehicle_id] = next(
+                (
+                    item for item in candidates
+                    if self._statistics_eligibility(vehicle_id, item) is None
+                ),
+                candidates[0],
+            )
+        return chosen
 
     def _require_vehicle(self, vehicle_id: str) -> Vehicle:
         try:
@@ -1716,6 +2326,7 @@ class AdvisorService:
         provenance: dict[str, Any] = {
             "vehicle_snapshot_id": self._vehicle_snapshot_id(),
             "battle_rating": self._battle_rating_provenance.get(vehicle_id),
+            "capabilities_contract": "resolved_capability_resolutions",
         }
         availability = self._resolved_availability.get(vehicle_id)
         if availability is not None:
@@ -1738,18 +2349,18 @@ def _combination_count(pool: int, slots: int) -> int:
     return numerator // denominator
 
 
-def _read_bounded_file(source: Path, maximum_bytes: int) -> bytes:
+def _read_bounded_file(source: Path, maximum_bytes: int, *, kind: str = "statistics") -> bytes:
     """Read one local import safely, including a size check resilient to file changes."""
 
     try:
         if source.stat().st_size > maximum_bytes:
-            raise ValueError("statistics import exceeds configured byte limit")
+            raise ValueError(f"{kind} import exceeds configured byte limit")
         with source.open("rb") as stream:
             payload = stream.read(maximum_bytes + 1)
     except OSError as exc:
-        raise ValueError(f"unable to read statistics source: {exc}") from exc
+        raise ValueError(f"unable to read {kind} source: {exc}") from exc
     if len(payload) > maximum_bytes:
-        raise ValueError("statistics import exceeds configured byte limit")
+        raise ValueError(f"{kind} import exceeds configured byte limit")
     return payload
 
 
@@ -1804,6 +2415,25 @@ def _prerequisites_satisfied(
         if requirement == "any" and not any(ownership):
             return False
     return True
+
+
+def _joined_community_aliases(
+    vehicles: Iterable[Vehicle | RawVehicleRecord], native: Mapping[str, str]
+) -> dict[str, str]:
+    """Admit only source-confirmed variants with no competing native identity."""
+
+    by_id = {vehicle.vehicle_id: vehicle for vehicle in vehicles}
+    candidates = (
+        ("us_halftrack_m3_75mm_gmc", "us_m3_gmc", "M3 GMC"),
+        ("us_m2a4_1st_armor_div", "us_m2a4_first_tank_div", "M2A4 (1st Arm.Div.)"),
+    )
+    return {
+        source: canonical
+        for source, canonical, expected_name in candidates
+        if canonical in by_id
+        and by_id[canonical].name == expected_name
+        and source not in native
+    }
 
 
 def _refresh_snapshot(snapshot: SnapshotRef, *, as_of: date) -> SnapshotRef:

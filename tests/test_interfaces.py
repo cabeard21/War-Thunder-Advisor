@@ -7,8 +7,33 @@ from pydantic import BaseModel
 from typer.testing import CliRunner
 
 from wt_advisor.cli.main import create_app
+from wt_advisor.domain.models import StatisticsScope
 from wt_advisor.mcp.server import create_server
 from wt_advisor.services.advisor import AdvisorService
+
+
+@pytest.mark.anyio
+async def test_cli_and_mcp_stats_show_proxy_exclusion_reason() -> None:
+    service = AdvisorService.from_m2_acceptance_fixture()
+    target = "us_m22"
+    row = service.get_vehicle_statistics(target)[0]
+    service._statistics = {
+        **service._statistics,
+        target: (row.model_copy(update={
+            "mode_scope": StatisticsScope.REALISTIC_ALL_CONTEXTS,
+        }),),
+    }
+    cli = CliRunner().invoke(
+        create_app(service), ["vehicle", "stats", target, "--json"]
+    )
+    assert cli.exit_code == 0, cli.output
+    cli_row = json.loads(cli.stdout)[0]
+    async with Client(create_server(service)) as client:
+        mcp = await client.call_tool("get_vehicle_statistics", {"vehicle_id": target})
+    assert mcp.structured_content["result"][0] == cli_row
+    assert cli_row["eligible"] is False
+    assert cli_row["proxy_used"] is False
+    assert cli_row["exclusion_reason"] == "synthetic_acceptance_fixture"
 
 
 class InspectionResult(BaseModel):
@@ -20,6 +45,47 @@ class InspectionResult(BaseModel):
 class StatusResult(BaseModel):
     schema_revision: str
     components: dict[str, str]
+
+
+@pytest.mark.anyio
+async def test_community_refresh_cli_and_mcp_delegate_to_same_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = AdvisorService.from_acceptance_fixture()
+    calls: list[str] = []
+
+    def refresh() -> dict[str, object]:
+        calls.append("refresh")
+        return {"outcome": "updated", "bundle_id": "new-bundle"}
+
+    monkeypatch.setattr(service, "refresh_community_evidence", refresh)
+    cli = CliRunner().invoke(create_app(service), ["data", "refresh-community", "--json"])
+    assert cli.exit_code == 0
+    assert json.loads(cli.output)["outcome"] == "updated"
+    async with Client(create_server(service)) as client:
+        mcp = await client.call_tool("refresh_community_evidence", {})
+    assert mcp.structured_content["outcome"] == "updated"
+    assert calls == ["refresh", "refresh"]
+
+
+def test_retained_community_reprocess_cli_delegates_without_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = AdvisorService.from_acceptance_fixture()
+    calls: list[str] = []
+
+    def reprocess() -> dict[str, object]:
+        calls.append("retained")
+        return {"outcome": "unchanged", "statistics_snapshot_id": "stats-v2"}
+
+    monkeypatch.setattr(service, "reprocess_retained_community_statistics", reprocess)
+    result = CliRunner().invoke(
+        create_app(service), ["data", "reprocess-community", "--json"]
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output)["statistics_snapshot_id"] == "stats-v2"
+    assert calls == ["retained"]
 
 
 class MilestoneTwoInterfaceService:
@@ -53,6 +119,27 @@ class MilestoneTwoInterfaceService:
     ) -> dict[str, object]:
         self.calls.append(("import", path, provider, str(purpose)))
         return {"provider": provider, "path": str(path), "imported": True}
+
+    def import_capabilities(
+        self, path: Path, *, provider: str, source_revision: str, vehicle_snapshot_id: str
+    ) -> dict[str, object]:
+        self.calls.append(("capabilities", path, provider, source_revision, vehicle_snapshot_id))
+        return {"provider": provider, "snapshot_id": "curated-test"}
+
+
+def test_cli_exposes_scoped_curated_capability_import(tmp_path: Path) -> None:
+    source = tmp_path / "capabilities.json"
+    source.write_text("[]", encoding="utf-8")
+    service = MilestoneTwoInterfaceService()
+
+    result = CliRunner().invoke(
+        create_app(service),  # type: ignore[arg-type]
+        ["capabilities", "import", str(source), "--provider", "manual",
+         "--source-revision", "r1", "--vehicle-snapshot-id", "vehicles-live", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert service.calls == [("capabilities", source, "manual", "r1", "vehicles-live")]
 
 
 def test_cli_generates_structured_lineups() -> None:

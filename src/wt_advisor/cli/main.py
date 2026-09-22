@@ -53,6 +53,15 @@ class _MilestoneTwoService(Protocol):
         purpose: SnapshotPurpose,
     ) -> object: ...
 
+    def import_capabilities(
+        self,
+        path: Path,
+        *,
+        provider: str,
+        source_revision: str,
+        vehicle_snapshot_id: str,
+    ) -> object: ...
+
 
 def _default_service() -> AdvisorService:
     database = Path(os.environ.get("WT_ADVISOR_DB", "wt-advisor.sqlite"))
@@ -96,6 +105,7 @@ def create_app(service: AdvisorService | None = None) -> typer.Typer:
     lineup = typer.Typer(help="Analyze and compare lineups.")
     progress = typer.Typer(help="Evaluate one-step progression.")
     statistics = typer.Typer(help="Inspect and import validated statistics evidence.")
+    capabilities = typer.Typer(help="Import verified capability observations.")
     preset = typer.Typer(help="Create and manage durable lineup presets.")
     context = typer.Typer(help="Inspect and update the saved advisor context.")
     evaluation = typer.Typer(help="Create and read immutable stored evaluations.")
@@ -106,6 +116,7 @@ def create_app(service: AdvisorService | None = None) -> typer.Typer:
     root.add_typer(lineup, name="lineup")
     root.add_typer(progress, name="progress")
     root.add_typer(statistics, name="statistics")
+    root.add_typer(capabilities, name="capabilities")
     root.add_typer(preset, name="preset")
     root.add_typer(context, name="context")
     root.add_typer(evaluation, name="evaluation")
@@ -130,6 +141,22 @@ def create_app(service: AdvisorService | None = None) -> typer.Typer:
         json_output: Annotated[bool, typer.Option("--json", help="Emit compact JSON.")] = False,
     ) -> None:
         _emit(advisor().data_status(), as_json=json_output)
+
+    @data.command("refresh-community")
+    def data_refresh_community(
+        json_output: Annotated[bool, typer.Option("--json", help="Emit compact JSON.")] = False,
+    ) -> None:
+        """Refresh bounded community evidence without replacing user state."""
+
+        _emit(advisor().refresh_community_evidence(), as_json=json_output)
+
+    @data.command("reprocess-community")
+    def data_reprocess_community(
+        json_output: Annotated[bool, typer.Option("--json", help="Emit compact JSON.")] = False,
+    ) -> None:
+        """Reprocess retained community CSV without contacting the vehicle API."""
+
+        _emit(advisor().reprocess_retained_community_statistics(), as_json=json_output)
 
     @data.command("import")
     def data_import(
@@ -181,7 +208,7 @@ def create_app(service: AdvisorService | None = None) -> typer.Typer:
         vehicle_id: str,
         json_output: Annotated[bool, typer.Option("--json", help="Emit compact JSON.")] = False,
     ) -> None:
-        _emit(advisor().get_vehicle_statistics(vehicle_id), as_json=json_output)
+        _emit(advisor().vehicle_statistics_status(vehicle_id), as_json=json_output)
 
     @profile.command("show")
     def profile_show(
@@ -260,6 +287,24 @@ def create_app(service: AdvisorService | None = None) -> typer.Typer:
         _emit(
             cast(_MilestoneTwoService, advisor()).inspect_statistics(
                 source, provider=provider, purpose=purpose
+            ),
+            as_json=json_output,
+        )
+
+    @capabilities.command("import")
+    def capabilities_import(
+        source: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
+        provider: Annotated[str, typer.Option("--provider")],
+        source_revision: Annotated[str, typer.Option("--source-revision")],
+        vehicle_snapshot_id: Annotated[str, typer.Option("--vehicle-snapshot-id")],
+        json_output: Annotated[bool, typer.Option("--json")] = False,
+    ) -> None:
+        _emit(
+            cast(_MilestoneTwoService, advisor()).import_capabilities(
+                source,
+                provider=provider,
+                source_revision=source_revision,
+                vehicle_snapshot_id=vehicle_snapshot_id,
             ),
             as_json=json_output,
         )

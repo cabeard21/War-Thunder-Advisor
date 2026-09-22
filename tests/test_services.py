@@ -1,17 +1,27 @@
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from wt_advisor.data.models import (
+    RawCapabilityDataset,
     RawDatasetMetadata,
     RawStatisticsDataset,
     RawVehicleDataset,
     RawVehicleRecord,
     canonical_bytes,
 )
+from wt_advisor.data.providers.community_statistics import (
+    PROVIDER as COMMUNITY_STATISTICS_PROVIDER,
+)
+from wt_advisor.data.providers.community_statistics import (
+    CommunityStatisticsProvider,
+)
 from wt_advisor.data.providers.fixture import FixtureProvider
+from wt_advisor.data.providers.wt_vehicles_api import WarThunderVehiclesApiProvider
 from wt_advisor.domain.models import (
     AcquisitionType,
     CandidateGroup,
@@ -31,6 +41,7 @@ from wt_advisor.domain.models import (
     VehicleStatus,
     Visibility,
 )
+from wt_advisor.rules import load_ruleset
 from wt_advisor.services.advisor import AdvisorService, _lower_alternative
 from wt_advisor.storage import EvidenceRepository, create_database
 
@@ -146,6 +157,402 @@ def test_data_status_exposes_independent_milestone_two_components() -> None:
     assert status["components"]["research_graph"]["status"] == "available"
     assert status["components"]["global_statistics"]["status"] == "available"
     assert status["active"]["bundle_id"]
+
+
+def test_capability_record_coverage_does_not_claim_field_completeness() -> None:
+    service = AdvisorService.from_m2_acceptance_fixture()
+
+    status = service.data_status()
+    capability_status = status["components"]["capabilities"]
+    scouting = capability_status["field_coverage"]["scouting"]
+
+    assert scouting["denominator"] == capability_status["total_count"]
+    assert sum(
+        scouting[state] for state in ("present", "verified_absent", "unknown", "conflicted")
+    ) == scouting["denominator"]
+    assert scouting["unknown"] > 0
+    assert capability_status["field_complete_count"] < capability_status["covered_count"]
+    assert capability_status["missing_pair_count"] > 0
+    assert any(gap["capability"] == "scouting" for gap in capability_status["missing_pairs"])
+    vehicle = service.get_vehicle("us_m3_stuart")
+    assert vehicle.provenance["capabilities_contract"] == "resolved_capability_resolutions"
+
+
+def test_profile_capability_coverage_uses_progress_not_catalog_denominator() -> None:
+    service = AdvisorService.from_m2_acceptance_fixture()
+
+    status = service.data_status()
+    profile = status["capability_coverage"]["profile"]
+    catalog = status["capability_coverage"]["catalog"]
+
+    assert profile["vehicle_count"] > 0
+    assert profile["vehicle_count"] <= catalog["vehicle_count"]
+    assert profile["scope"] == "owned_and_immediate_research"
+    assert profile["field_coverage"]["scouting"]["denominator"] == profile["vehicle_count"]
+
+
+def test_statistics_diagnostics_distinguish_reported_ratio_without_denominator() -> None:
+    service = AdvisorService.from_acceptance_fixture()
+    row = service.get_vehicle_statistics("us_m3_lee")[0]
+    reported_only = row.model_copy(update={
+        "battles": None, "wins": None, "win_rate": None, "reported_win_rate": 0.5,
+    })
+    service._statistics = {**service._statistics, "us_m3_lee": (reported_only,)}
+
+    status = service.data_status()["statistics_coverage"]["catalog"]
+
+    assert any(
+        gap == {
+            "vehicle_id": "us_m3_lee", "metric": "win_rate",
+            "reason": "missing_sample_metadata",
+        }
+        for gap in status["gaps"]
+    )
+
+
+def test_scoring_prefers_verified_ground_rb_and_uses_one_proxy_fallback() -> None:
+    service = AdvisorService.from_m2_acceptance_fixture()
+    proxy_rows = {
+        vehicle_id: VehicleStatistics(
+            vehicle_id=vehicle_id,
+            snapshot_id="community-test",
+            mode_scope=StatisticsScope.REALISTIC_ALL_CONTEXTS,
+            sample_end=service._evaluation_date,
+            battles=3000,
+            reported_win_rate=0.45 + index * 0.002,
+            reported_kills_per_battle=0.8 + index * 0.02,
+        )
+        for index, vehicle_id in enumerate(sorted(service._statistics))
+    }
+    service._statistics = {
+        vehicle_id: (verified[0], proxy_rows[vehicle_id])
+        for vehicle_id, verified in service._statistics.items()
+    }
+    target = "us_m22"
+    assert service._scoring_statistics()[target].mode_scope is (
+        StatisticsScope.GROUND_REALISTIC_GROUND_VEHICLES
+    )
+    service._statistics = {
+        **service._statistics,
+        target: (proxy_rows[target],),
+    }
+    assert service._scoring_statistics()[target] == proxy_rows[target]
+    analysis = service.analyze_lineup((target,))
+    rule = next(item for item in analysis.rules if item.rule == "statistical_strength")
+    detail = rule.evidence["vehicles"][target]
+    assert detail["eligible"] is True
+    assert detail["proxy_used"] is True
+    assert detail["source_scope"] == StatisticsScope.REALISTIC_ALL_CONTEXTS.value
+    assert detail["exclusion_reason"] is None
+    status = service.vehicle_statistics_status(target)[0]
+    assert status["eligible"] is True
+    assert status["proxy_used"] is True
+    assert status["source_scope"] == StatisticsScope.REALISTIC_ALL_CONTEXTS.value
+    assert status["exclusion_reason"] is None
+
+
+def test_synthetic_acceptance_proxy_is_excluded_from_scoring() -> None:
+    service = AdvisorService.from_m2_acceptance_fixture()
+    target = "us_m22"
+    fixture = service._statistics[target][0]
+    proxy = VehicleStatistics(
+        vehicle_id=target,
+        snapshot_id=fixture.snapshot_id,
+        mode_scope=StatisticsScope.REALISTIC_ALL_CONTEXTS,
+        sample_end=service._evaluation_date,
+        battles=3000,
+        reported_win_rate=0.6,
+    )
+    service._statistics = {**service._statistics, target: (proxy,)}
+    analysis = service.analyze_lineup((target,))
+    rule = next(item for item in analysis.rules if item.rule == "statistical_strength")
+    detail = rule.evidence["vehicles"][target]
+    assert detail["eligible"] is False
+    assert detail["proxy_used"] is False
+    assert detail["exclusion_reason"] == "synthetic_acceptance_fixture"
+    assert rule.score is None
+    assert service.vehicle_statistics_status(target)[0]["exclusion_reason"] == (
+        "synthetic_acceptance_fixture"
+    )
+
+
+def test_scoring_policy_hash_marks_saved_evaluation_stale_without_rewriting_it(
+    tmp_path: Path,
+) -> None:
+    service = AdvisorService.from_database(tmp_path / "advisor.sqlite")
+    assert load_ruleset("m2-capability-aware-v1").scoring_policy_version == (
+        "community-rb-proxy-v1"
+    )
+    created = service.evaluate_and_store(profile_id="acceptance", top_n=2)
+    evaluation_id = created["evaluation_id"]
+    assert service.get_stored_evaluation("acceptance", evaluation_id)["stale"] is False
+    original = service.get_stored_evaluation("acceptance", evaluation_id)["result"]
+    service._evidence_context = service._evidence_context.model_copy(
+        update={"ruleset_hash": "0" * 64}
+    )
+    fetched = service.get_stored_evaluation("acceptance", evaluation_id)
+    assert "ruleset_changed" in fetched["stale_reasons"]
+    assert fetched["result"] == original
+
+
+def test_curated_capability_import_remains_selected_with_provider_refresh(tmp_path: Path) -> None:
+    database = tmp_path / "advisor.sqlite"
+    AdvisorService.from_database(database)
+    _import_newer_operational_vehicles(database)
+    source = tmp_path / "capabilities.json"
+    source.write_text(json.dumps([{
+        "vehicle_id": "us_m3_lee", "capability": "scouting", "value": False,
+        "source_provider": "manual_reference", "source_reference": "test:scouting-absence",
+        "source_type": "curated_import", "verified_at": "2026-09-21",
+        "source_revision": "test-r1",
+    }]), encoding="utf-8")
+
+    service = AdvisorService.from_database(database)
+    imported = service.import_capabilities(
+        source, provider="manual_reference", source_revision="test-r1",
+        vehicle_snapshot_id="vehicles-live",
+    )
+    reopened = AdvisorService.from_database(database)
+
+    assert imported.dataset_type is DatasetType.CAPABILITIES
+    assert reopened.data_status()["active"]["capability_snapshot_ids"] == [imported.snapshot_id]
+    resolutions = reopened.get_vehicle("us_m3_lee").provenance["capability_resolutions"]
+    assert any(
+        row["capability"] == "scouting" and row["state"] == "verified_absent"
+        for row in resolutions
+    )
+    assert reopened.import_capabilities(
+        source, provider="manual_reference", source_revision="test-r1",
+        vehicle_snapshot_id="vehicles-live",
+    ).snapshot_id == imported.snapshot_id
+
+    api_claim = [{
+        "vehicle_id": "us_m3_lee", "capability": "scouting", "value": True,
+        "source_provider": "war_thunder_vehicles_community_api",
+        "source_reference": "test:api-scouting", "source_type": "community_api",
+    }]
+    api_content = canonical_bytes(api_claim)
+    api_snapshot = RawDatasetMetadata(
+        snapshot_id="capabilities-api-refresh",
+        dataset_type=DatasetType.CAPABILITIES,
+        provider="war_thunder_vehicles_community_api",
+        retrieved_at=imported.retrieved_at + timedelta(seconds=1),
+    ).snapshot(api_content)
+    EvidenceRepository(create_database(database)).import_capability_snapshot(
+        api_snapshot, api_claim, raw_content=api_content
+    )
+    refreshed = AdvisorService.from_database(database)
+    resolved = refreshed.get_vehicle("us_m3_lee").provenance["capability_resolutions"]
+    scouting = next(row for row in resolved if row["capability"] == "scouting")
+    assert scouting["state"] == "conflicted"
+    assert {row["source_snapshot_id"] for row in scouting["observations"]} == {
+        imported.snapshot_id, api_snapshot.snapshot_id,
+    }
+    assert refreshed.data_status()["active"]["capability_snapshot_ids"] == [
+        api_snapshot.snapshot_id, imported.snapshot_id,
+    ]
+
+
+def test_community_refresh_failure_keeps_active_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = AdvisorService.from_database(tmp_path / "refresh.sqlite")
+    before = service.data_status()["active"]["bundle_id"]
+
+    def unavailable(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("source offline")
+
+    monkeypatch.setattr(WarThunderVehiclesApiProvider, "fetch_operational_components", unavailable)
+    result = service.refresh_community_evidence()
+
+    assert result["outcome"] == "failed"
+    assert result["previous_bundle_id"] == before
+    assert result["bundle_id"] == before
+    assert service.data_status()["active"]["bundle_id"] == before
+
+
+def test_reprocess_retained_community_statistics_without_vehicle_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "retained.sqlite"
+    AdvisorService.from_database(database)
+    _import_newer_operational_vehicles(database)
+    repository = EvidenceRepository(create_database(database))
+    content = (
+        b"name,nation,cls,rb_battles,rb_win_rate,rb_ground_frags_per_battle,"
+        b"rb_ground_frags_per_death\n"
+        b"us_m3_lee,USA,Ground_vehicles,3000,52,1.1,1.4\n"
+    )
+    old_snapshot = RawDatasetMetadata(
+        snapshot_id="community-statistics-20260920-old-v1",
+        dataset_type=DatasetType.GLOBAL_STATISTICS,
+        provider=COMMUNITY_STATISTICS_PROVIDER,
+        retrieved_at=datetime(2026, 9, 20, tzinfo=UTC),
+        source_revision="old-source-etag",
+        sample_start=date(2026, 9, 20),
+        sample_end=date(2026, 9, 20),
+    ).snapshot(content)
+    repository.import_statistics_snapshot(
+        old_snapshot, (), raw_content=content, provider_version="joined-rb-v1"
+    )
+    service = AdvisorService.from_database(database)
+    before = service.data_status()["active"]["bundle_id"]
+    progress = service.get_user_progress("acceptance")
+    evaluation = service.evaluate_and_store(profile_id="acceptance", top_n=1)
+
+    def no_vehicle_fetch(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("retained reprocess must not refresh vehicles")
+
+    monkeypatch.setattr(
+        WarThunderVehiclesApiProvider, "fetch_operational_components", no_vehicle_fetch
+    )
+    first = service.reprocess_retained_community_statistics()
+    second = service.reprocess_retained_community_statistics()
+
+    assert first["outcome"] == "updated"
+    assert first["previous_bundle_id"] == before
+    assert first["statistics_snapshot_id"] != old_snapshot.snapshot_id
+    assert service.data_status()["active"]["statistics_snapshot_id"] == first[
+        "statistics_snapshot_id"
+    ]
+    assert second["outcome"] == "unchanged"
+    assert second["statistics_snapshot_id"] == first["statistics_snapshot_id"]
+    assert service.get_user_progress("acceptance") == progress
+    assert service.get_stored_evaluation("acceptance", evaluation["evaluation_id"])[
+        "result"
+    ] == evaluation["result"]
+
+
+def test_reprocess_requires_retained_community_artifact(tmp_path: Path) -> None:
+    service = AdvisorService.from_database(tmp_path / "no-community.sqlite")
+    before = service.data_status()["active"]["bundle_id"]
+
+    with pytest.raises(ValueError, match="retained community statistics"):
+        service.reprocess_retained_community_statistics()
+
+    assert service.data_status()["active"]["bundle_id"] == before
+
+
+def test_joined_aliases_require_exact_canonical_variant_and_no_native_collision() -> None:
+    service = AdvisorService.from_acceptance_fixture()
+    aliases = service._statistics_identity_aliases(COMMUNITY_STATISTICS_PROVIDER)
+
+    assert aliases["us_halftrack_m3_75mm_gmc"] == "us_m3_gmc"
+    assert aliases["us_m2a4_1st_armor_div"] == "us_m2a4_first_tank_div"
+    assert aliases["us_m3_stuart"] == "us_m3_stuart"
+    assert aliases["us_m3a1_stuart"] == "us_m3a1_stuart"
+    altered = service._vehicles["us_m3_gmc"].model_copy(update={"name": "Different vehicle"})
+    service._vehicles = {**service._vehicles, "us_m3_gmc": altered}
+    assert "us_halftrack_m3_75mm_gmc" not in service._statistics_identity_aliases(
+        COMMUNITY_STATISTICS_PROVIDER
+    )
+    colliding = service._vehicles["us_m3_stuart"].model_copy(
+        update={"source_vehicle_id": "us_m2a4_1st_armor_div"}
+    )
+    service._vehicles = {**service._vehicles, "us_m3_stuart": colliding}
+    assert service._statistics_identity_aliases(COMMUNITY_STATISTICS_PROVIDER)[
+        "us_m2a4_1st_armor_div"
+    ] == "us_m3_stuart"
+
+
+def test_community_refresh_rate_limit_is_reported_without_publishing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = AdvisorService.from_database(tmp_path / "rate-limit.sqlite")
+    before = service.data_status()["active"]["bundle_id"]
+    request = httpx.Request("GET", "https://example.com/api/vehicles")
+    response = httpx.Response(429, request=request)
+
+    def rate_limited(*_args: object, **_kwargs: object) -> object:
+        raise httpx.HTTPStatusError("rate limited", request=request, response=response)
+
+    monkeypatch.setattr(WarThunderVehiclesApiProvider, "fetch_operational_components", rate_limited)
+    result = service.refresh_community_evidence()
+
+    assert result["outcome"] == "failed"
+    assert "rate limited" in result["message"]
+    assert result["bundle_id"] == before
+
+
+def test_community_refresh_publishes_vehicle_evidence_without_statistics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = AdvisorService.from_database(tmp_path / "refresh-success.sqlite")
+    before = service.data_status()["active"]["bundle_id"]
+    fixture = FixtureProvider().load()
+    vehicle_snapshot = RawDatasetMetadata(
+        snapshot_id="community-refresh-vehicles",
+        dataset_type=DatasetType.VEHICLE_METADATA,
+        provider="test_community",
+        retrieved_at=datetime(2026, 9, 21, tzinfo=UTC),
+        source_revision="r1",
+        compatibility_key="test-community:r1",
+    ).snapshot(fixture.vehicles.raw_content)
+    vehicles = RawVehicleDataset(
+        snapshot=vehicle_snapshot,
+        records=fixture.vehicles.records,
+        raw_content=fixture.vehicles.raw_content,
+    )
+    capability_content = b"[]"
+    capabilities = RawCapabilityDataset(
+        snapshot=RawDatasetMetadata(
+            snapshot_id="community-refresh-capabilities",
+            dataset_type=DatasetType.CAPABILITIES,
+            provider="test_community",
+            retrieved_at=datetime(2026, 9, 21, tzinfo=UTC),
+            source_revision="r1",
+            compatibility_key="test-community:r1",
+        ).snapshot(capability_content),
+        records=(),
+        raw_content=capability_content,
+    )
+    monkeypatch.setattr(
+        WarThunderVehiclesApiProvider,
+        "fetch_operational_components",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            vehicles=vehicles, capabilities=capabilities,
+            availability=None, research_graph=None,
+        ),
+    )
+    monkeypatch.setattr(
+        CommunityStatisticsProvider,
+        "fetch_statistics",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            dataset=None, accepted_count=0, quarantine_counts={"unmapped": 2},
+            eligible_count=0, observation_date=date(2026, 9, 20),
+            source_url="https://example.com/context.csv", source_revision="r1",
+            age_days=1, reason="context only",
+        ),
+    )
+
+    result = service.refresh_community_evidence()
+
+    assert result["outcome"] == "updated"
+    assert result["bundle_id"] != before
+    assert result["quarantined_statistics_rows"] == 2
+    assert service.data_status()["active"]["vehicle_snapshot_id"] == vehicle_snapshot.snapshot_id
+
+
+def test_local_capability_import_cannot_impersonate_community_api(tmp_path: Path) -> None:
+    database = tmp_path / "advisor.sqlite"
+    AdvisorService.from_database(database)
+    _import_newer_operational_vehicles(database)
+    source = tmp_path / "claims.json"
+    source.write_text(json.dumps([{
+        "vehicle_id": "us_m3_lee", "capability": "scouting", "value": True,
+        "source_provider": "manual_reference", "source_reference": "test:forged-api",
+        "source_type": "community_api", "source_revision": "test-r1",
+    }]), encoding="utf-8")
+    service = AdvisorService.from_database(database)
+
+    with pytest.raises(ValueError, match="curated_import"):
+        service.import_capabilities(
+            source, provider="manual_reference", source_revision="test-r1",
+            vehicle_snapshot_id="vehicles-live",
+        )
+    assert AdvisorService.from_database(database).data_status()["active"][
+        "capability_snapshot_ids"
+    ] == []
 
 
 def test_statistics_inspection_is_read_only_and_resolves_provider_ids(
@@ -511,6 +918,8 @@ def test_live_vehicle_snapshot_runs_without_attaching_acceptance_statistics(
     assert status["active"]["vehicle_snapshot_id"] == "vehicles-live"
     assert status["active"]["statistics_snapshot_id"] is None
     assert status["active"]["statistics_status"] == "unavailable"
+    assert status["statistics_coverage"]["catalog"]["reason_counts"]["incompatible_snapshot"] > 0
+    assert status["statistics_coverage"]["profile"]["vehicle_count"] > 0
     assert "statistics_unavailable" in status["active"]["warnings"]
     assert status["active"]["research_graph_available"] is False
     assert recommended is not None

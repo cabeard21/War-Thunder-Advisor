@@ -311,7 +311,7 @@ def build_m3_acceptance_report(_: AdvisorService) -> dict[str, Any]:
                 restarted.get_advisor_context("acceptance").selected_preset_id == preset.preset_id
             ),
             "stale_public_revision_is_rejected": conflict_rejected,
-            "runtime_schema_is_m3_head": service.data_status()["schema_revision"] == "0005",
+            "runtime_schema_is_m3_head": service.data_status()["schema_revision"] == "0006",
         }
         report = {
             "milestone": 3,
