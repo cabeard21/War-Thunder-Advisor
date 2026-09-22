@@ -3,13 +3,14 @@
 The application follows one direction of dependency:
 
 ```text
-providers / fixtures -> immutable snapshots -> domain services -> CLI and MCP
+providers / fixtures -> immutable snapshots -> domain services -> advisor snapshot
+                                                         -> dashboard / CLI / optional MCP
                                       \-> pure rules -/
 ```
 
 ## Evidence and storage
 
-SQLite is managed by Alembic through revision `0006`. Imported payloads create immutable dataset
+SQLite is managed by Alembic through revision `0008`. Imported payloads create immutable dataset
 snapshots and raw artifacts. Metadata, capabilities, resolved availability, identity aliases,
 research graphs, and statistics are independently versioned components. User profiles and vehicle
 statuses are stored separately and revisioned on mutation; alias reconciliation has dry-run,
@@ -85,9 +86,95 @@ One-step progression returns the best expanded-pool and forced-include lineups p
 frontier, role, readiness, research-cost, and cross-BR facts. Hypothetical ownership is request-local
 and does not mutate profile state.
 
+## Deterministic advisor snapshot
+
+`AdvisorService.compute_advisor_snapshot` captures garage, saved context, selected preset, and
+evidence identity together, then composes the existing lineup evaluator into one structured
+answer. The highest readiness-passing BR determines the band; preferences only order candidates
+within it. Research priorities use one-step forced-include lineups, report recovery targets when
+no current lineup passes readiness, and never compare raw scores across BRs. Reasons are
+deterministic codes with underlying analyses attached.
+
+### Bounded preference ranking
+
+Objective scoring is unchanged. Preferences contribute a separate, separately bounded term:
+
+```text
+recommendation_score  = objective_score + preference_adjustment
+preference_adjustment = ROLE_CAP * role_satisfaction
+                      - DUPLICATE_CAP * duplicate_strength * duplicate_load
+```
+
+`ROLE_CAP` (1.5) bounds the preferred-role term alone and `DUPLICATE_CAP` (1.5) the duplicate-role
+term alone. `PREFERENCE_CAP` is the envelope on a single candidate's adjustment; the caps are not
+summed into it. The binding invariant is `MAX_PREFERENCE_SWING` (`ROLE_CAP + DUPLICATE_CAP` = 3.0):
+the largest objective deficit any preference can overcome, since reordering depends on the
+*difference* between two candidates' adjustments rather than on either one alone.
+
+Those numbers come from the live USA ground RB garage, measured over the population actually
+ranked — the full readiness-passing set at each BR. Adjacent objective gaps inside such a pool have
+a median of 0.004, p90 of 1.41 and p95 of 2.50, while the smallest per-BR top-to-bottom span is
+7.32. A 3.0 swing therefore crosses roughly the lowest 98% of adjacent gaps while leaving a
+bottom-of-pool lineup unable to reach the top of any BR. Measured over that garage the largest
+objective score any winner actually gave up was 0.80, no Pareto-dominated candidate became primary
+at any BR, and the winning lineup was identical at swings of 2.0, 3.0 and 4.0.
+
+`duplicate_role_penalty` keeps its stored `int` 0–10 range and now means duplicate-role **avoidance
+strength**: 0 disables the term and 10 drives it to `DUPLICATE_CAP`. It is not a cap on preference
+influence in general and has no effect on the preferred-role term.
+
+A duplicate is a repeat of a vehicle's **canonical primary role**, one per vehicle class, so a tank
+destroyer counts once rather than twice through both `tank_destroyer` and `sniper`. SPAA is exempt,
+because `anti_air_rule` and the diagnostic specialist-redundancy rule already govern it, and backup
+depth is untouched since it is already a weighted component of the objective score. Preferred-role
+*satisfaction* still uses the full capability-aware role set, resolved through `rules.resolve_roles`
+so the active ruleset decides. Duplicate counts saturate at 3, the observed maximum.
+
+Readiness and BR-frontier selection remain authoritative and are evaluated first. A preference can
+never promote an unready lineup, never change which battle rating is recommended, and never alter
+`objective_score`; it only orders candidates inside the band the frontier already chose.
+
+Preferences rank the **full readiness-passing set at the selected BR**, not the Pareto frontier.
+Dominance compares only the objective rule-score vector, so it is blind to readiness and to role
+composition and can prune a preference-satisfying lineup before preferences are ever applied — at
+the live BR 3.0 case it cuts seven candidates to one. Widening re-admits only candidates that
+already passed readiness and every hard constraint, so no hard invariant is affected; the
+preference cap is what keeps materially inferior candidates from winning.
+
+### Explanations
+
+`services/explanations.py` maps reason codes and measured values to player-facing sentences,
+deterministically and with no model. Structured codes and provenance remain the source of truth and
+are unchanged in the payload. Explanations separate **strengths**, **tradeoffs** and **warnings**:
+an unmet preference is always a tradeoff, never a strength and never a readiness blocker. A
+preference that lost to a stronger lineup is worded differently from one that no ready lineup at
+the selected BR can satisfy, and the latter carries a pointer to the ranked research target that
+would change it. Alternatives report their differences, and deliberately omit any score delta
+across battle ratings.
+
+`role_redundancy` is zero-weight, diagnostic and SPAA-only, and its `GOOD` status is vacuous below
+two SPAA, so it is no longer swept into the lineup's strengths. Reason codes are now mapped from
+rules explicitly, which also stops a newly added rule from silently becoming a user-facing strength.
+
+Completed answers are immutable `stored_evaluations` of kind `advisor_snapshot`. The read path
+selects the latest answer and compares its captured source fingerprint to current garage,
+context/preferences, selected preset, ruleset, evidence, and recommendation policy. Ranking policy
+lives in code rather than the evidence ruleset, so `RECOMMENDATION_POLICY_VERSION` is fingerprinted
+separately: any change that could alter recommendation ordering or its interpretation bumps it and
+stales every snapshot stored under the previous policy, reported as `policy_changed`. A stale result
+remains visible;
+refresh is a separate bounded single-worker operation and never blocks garage/progression reads.
+The dashboard starts a refresh when an answer is missing or stale, polls while computing, and
+retains the previous answer if recomputation fails. The local worker is process-scoped; restarting
+the application recovers the persisted answer and can start a new refresh.
+
 ## Interfaces
 
-The Typer CLI and MCP 2.x stdio server are thin adapters over `AdvisorService`. MCP exposes:
+The dashboard, Typer CLI, and MCP 2.x stdio server consume `AdvisorService` directly. The
+dashboard does not need MCP or an LLM. `advisor show`/`advisor refresh`, the local HTTP advisor
+read/refresh endpoints, and MCP `get_advisor_snapshot` share the persisted result. Existing MCP
+tools remain for compatibility; low-level orchestration tools are deprecation candidates only
+after downstream clients have migrated. MCP also exposes:
 
 - `get_data_status`
 - `list_vehicles`
@@ -102,6 +189,20 @@ The Typer CLI and MCP 2.x stdio server are thin adapters over `AdvisorService`. 
 - `evaluate_next_unlocks`
 
 All tools except the idempotent profile mutation are annotated read-only. Structured responses use the same Pydantic DTOs as the CLI, allowing deterministic `analysis_id` parity tests.
+
+## Test coverage status
+
+`pyproject.toml` enforces `fail_under = 80`, which applies to **line** coverage; the suite passes
+that comfortably (91.61%).
+
+`scripts/check_coverage.py` is a stricter standalone tool that checks line and branch coverage
+independently against the same threshold. Its **branch** check currently fails: 78.35% against an
+80% target. This is a pre-existing condition, not a regression — branch coverage measured without
+the bounded-preference work is 77.92%, so that change raised it by 0.43 points. The shortfall is
+spread across older modules (`services/advisor.py` 70.3%, `storage/repository.py` 71.1%,
+`storage/db.py` 42.9%). The script is not wired into any CI or build step; there is no `.github/`
+workflow in the repository. Closing the gap is tracked as separate work rather than papered over
+with tests written only to move the number.
 
 ## Local security boundary
 

@@ -401,6 +401,8 @@ class AdvisorContextRow(Base):
     target_br: Mapped[int | None] = mapped_column(Integer)
     required_vehicle_ids: Mapped[Any] = mapped_column(JSON, nullable=False)
     excluded_vehicle_ids: Mapped[Any] = mapped_column(JSON, nullable=False)
+    preferred_roles: Mapped[Any] = mapped_column(JSON, nullable=False, default=list)
+    duplicate_role_penalty: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 

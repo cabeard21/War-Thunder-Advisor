@@ -15,7 +15,7 @@ import typer
 import uvicorn
 from pydantic import BaseModel
 
-from wt_advisor.domain.models import GameMode, Nation, SnapshotPurpose, VehicleStatus
+from wt_advisor.domain.models import GameMode, Nation, Role, SnapshotPurpose, VehicleStatus
 from wt_advisor.services.acceptance import (
     build_acceptance_report,
     build_m2_acceptance_report,
@@ -109,6 +109,7 @@ def create_app(service: AdvisorService | None = None) -> typer.Typer:
     preset = typer.Typer(help="Create and manage durable lineup presets.")
     context = typer.Typer(help="Inspect and update the saved advisor context.")
     evaluation = typer.Typer(help="Create and read immutable stored evaluations.")
+    advisor_snapshot = typer.Typer(help="Read and refresh the deterministic advisor answer.")
     root.add_typer(data, name="data")
     root.add_typer(vehicles, name="vehicles")
     root.add_typer(vehicle, name="vehicle")
@@ -120,6 +121,7 @@ def create_app(service: AdvisorService | None = None) -> typer.Typer:
     root.add_typer(preset, name="preset")
     root.add_typer(context, name="context")
     root.add_typer(evaluation, name="evaluation")
+    root.add_typer(advisor_snapshot, name="advisor")
 
     @root.command("dashboard")
     def dashboard(port: Annotated[int, typer.Option(min=1024, max=65535)] = 8765) -> None:
@@ -135,6 +137,20 @@ def create_app(service: AdvisorService | None = None) -> typer.Typer:
         if resolved_service is None:
             resolved_service = _default_service()
         return resolved_service
+
+    @advisor_snapshot.command("show")
+    def advisor_show(
+        profile_id: Annotated[str, typer.Option("--profile")] = "acceptance",
+        json_output: Annotated[bool, typer.Option("--json")] = False,
+    ) -> None:
+        _emit(advisor().get_advisor_snapshot(profile_id), as_json=json_output)
+
+    @advisor_snapshot.command("refresh")
+    def advisor_refresh(
+        profile_id: Annotated[str, typer.Option("--profile")] = "acceptance",
+        json_output: Annotated[bool, typer.Option("--json")] = False,
+    ) -> None:
+        _emit(advisor().refresh_advisor_snapshot(profile_id), as_json=json_output)
 
     @data.command("status")
     def data_status(
@@ -494,6 +510,12 @@ def create_app(service: AdvisorService | None = None) -> typer.Typer:
         excluded_vehicle_ids: Annotated[
             list[str] | None, typer.Option("--excluded-vehicle-id")
         ] = None,
+        preferred_roles: Annotated[
+            list[Role] | None, typer.Option("--preferred-role")
+        ] = None,
+        duplicate_role_penalty: Annotated[
+            int | None, typer.Option("--duplicate-role-penalty", min=0, max=10)
+        ] = None,
         json_output: Annotated[bool, typer.Option("--json")] = False,
     ) -> None:
         if clear_preset and selected_preset_id is not None:
@@ -508,6 +530,8 @@ def create_app(service: AdvisorService | None = None) -> typer.Typer:
                 required_vehicle_ids=tuple(required_vehicle_ids or ()),
                 excluded_vehicle_ids=tuple(excluded_vehicle_ids or ()),
                 expected_revision=expected_revision,
+                preferred_roles=preferred_roles,
+                duplicate_role_penalty=duplicate_role_penalty,
             ),
             as_json=json_output,
         )

@@ -9,7 +9,7 @@ from datetime import UTC, date, datetime
 from hashlib import sha256
 from typing import Any, Protocol, cast
 
-from sqlalchemy import Engine, select, update
+from sqlalchemy import Engine, select, text, update
 from sqlalchemy.orm import Session
 
 from wt_advisor.data.models import (
@@ -40,6 +40,7 @@ from wt_advisor.domain.models import (
     ResearchEdge,
     ResearchEdgeType,
     ResolvedAvailability,
+    Role,
     SnapshotPurpose,
     SnapshotRef,
     StatisticsScope,
@@ -198,6 +199,8 @@ class StoredAdvisorContext:
     required_vehicle_ids: tuple[str, ...]
     excluded_vehicle_ids: tuple[str, ...]
     revision: int
+    preferred_roles: tuple[Role, ...] = ()
+    duplicate_role_penalty: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1763,6 +1766,24 @@ class EvidenceRepository:
                 return None
             return self._stored_evaluation(row)
 
+    def get_latest_advisor_snapshot(
+        self, profile_id: str, *, fingerprint: str | None = None
+    ) -> StoredEvaluation | None:
+        with self.session() as session:
+            row = session.scalars(
+                select(StoredEvaluationRow)
+                .where(
+                    StoredEvaluationRow.profile_id == profile_id,
+                    StoredEvaluationRow.kind == "advisor_snapshot",
+                    *(() if fingerprint is None else (
+                        StoredEvaluationRow.profile_revision == fingerprint,
+                    )),
+                )
+                .order_by(text("stored_evaluations.rowid DESC"))
+                .limit(1)
+            ).first()
+            return None if row is None else self._stored_evaluation(row)
+
     def capture_evaluation_snapshot(
         self, profile_id: str, *, preset_id: str | None = None
     ) -> EvaluationSnapshot:
@@ -1794,6 +1815,8 @@ class EvidenceRepository:
                     tuple(context_row.required_vehicle_ids),
                     tuple(context_row.excluded_vehicle_ids),
                     context_row.revision,
+                    tuple(Role(value) for value in context_row.preferred_roles),
+                    context_row.duplicate_role_penalty,
                 )
             )
             selected_preset_id = preset_id or context.selected_preset_id
@@ -1931,6 +1954,8 @@ class EvidenceRepository:
                 tuple(row.required_vehicle_ids),
                 tuple(row.excluded_vehicle_ids),
                 row.revision,
+                tuple(Role(value) for value in row.preferred_roles),
+                row.duplicate_role_penalty,
             )
 
     def update_advisor_context(
@@ -1942,7 +1967,21 @@ class EvidenceRepository:
         required_vehicle_ids: tuple[str, ...],
         excluded_vehicle_ids: tuple[str, ...],
         expected_revision: int | str,
+        preferred_roles: tuple[Role, ...] | None = None,
+        duplicate_role_penalty: int | None = None,
     ) -> StoredAdvisorContext:
+        if preferred_roles is not None:
+            normalized_roles = tuple(Role(role) for role in preferred_roles)
+            if len(normalized_roles) != len(set(normalized_roles)):
+                raise ValueError("preferred_roles must not contain duplicates")
+        else:
+            normalized_roles = None
+        if duplicate_role_penalty is not None and (
+            isinstance(duplicate_role_penalty, bool)
+            or not isinstance(duplicate_role_penalty, int)
+            or not 0 <= duplicate_role_penalty <= 10
+        ):
+            raise ValueError("duplicate_role_penalty must be an integer from 0 to 10")
         with self.session() as session:
             if session.get(UserProfileRow, profile_id) is None:
                 raise LookupError(f"unknown profile {profile_id!r}")
@@ -1961,6 +2000,8 @@ class EvidenceRepository:
                     target_br=target_br,
                     required_vehicle_ids=list(required_vehicle_ids),
                     excluded_vehicle_ids=list(excluded_vehicle_ids),
+                    preferred_roles=list(normalized_roles or ()),
+                    duplicate_role_penalty=duplicate_role_penalty or 0,
                     revision=1,
                 )
                 session.add(row)
@@ -1970,12 +2011,20 @@ class EvidenceRepository:
                     row.target_br,
                     row.required_vehicle_ids,
                     row.excluded_vehicle_ids,
+                    row.preferred_roles,
+                    row.duplicate_role_penalty,
                     row.revision,
                 ) = (
                     selected_preset_id,
                     target_br,
                     list(required_vehicle_ids),
                     list(excluded_vehicle_ids),
+                    list(normalized_roles) if normalized_roles is not None else row.preferred_roles,
+                    (
+                        duplicate_role_penalty
+                        if duplicate_role_penalty is not None
+                        else row.duplicate_role_penalty
+                    ),
                     current + 1,
                 )
             return StoredAdvisorContext(
@@ -1985,6 +2034,8 @@ class EvidenceRepository:
                 tuple(row.required_vehicle_ids),
                 tuple(row.excluded_vehicle_ids),
                 row.revision,
+                tuple(Role(value) for value in row.preferred_roles),
+                row.duplicate_role_penalty,
             )
 
     def reconcile_profile_aliases(

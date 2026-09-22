@@ -1,4 +1,4 @@
-import type { ApiError, CommunityRefreshResult, DashboardState, Json, Preset, RecordValue } from "./types";
+import type { AdvisorSnapshotState, ApiError, CommunityRefreshResult, DashboardState, Json, Preset, RecordValue } from "./types";
 
 const base = "/api";
 
@@ -64,8 +64,9 @@ export const api = {
       request<RecordValue>(`/profiles/${encodeURIComponent(profileId)}/context`),
       request<Preset[]>(`/profiles/${encodeURIComponent(profileId)}/presets`),
       request<RecordValue | Json[]>("/vehicles"),
+      request<RecordValue>("/data-status"),
     ]);
-    const labels = ["garage", "context", "presets", "vehicles"];
+    const labels = ["garage", "context", "presets", "vehicles", "data health"];
     const load_errors = results.flatMap((result, index) => result.status === "rejected"
       ? [`Unable to load ${labels[index]}: ${result.reason instanceof Error ? result.reason.message : "request failed"}`]
       : []);
@@ -79,30 +80,18 @@ export const api = {
     const catalog = Array.isArray(vehicles) ? vehicles : (vehicles.vehicles ?? []);
     return {
       load_errors,
-      profile: (progress.profile ?? progress) as RecordValue,
+      profile: {
+        ...((progress.profile ?? progress) as RecordValue),
+        revision: progress.revision as Json,
+      },
       context: context as unknown as DashboardState["context"],
       presets,
+      evidence_health: value(4) as RecordValue | undefined,
       vehicles: (catalog as unknown as import("./types").Vehicle[]).map((vehicle) => ({ ...vehicle, status: statusByVehicle[vehicle.vehicle_id] ?? vehicle.status })),
     };
   },
-  dashboardInsights: async (profileId: string): Promise<DashboardState> => {
-    const results = await Promise.allSettled([
-      request<RecordValue>("/evaluate", { method: "POST", body: JSON.stringify({ profile_id: profileId }) }),
-      request<RecordValue | Json[]>(`/profiles/${encodeURIComponent(profileId)}/unlock-evaluations`),
-      request<RecordValue>("/data-status"),
-    ]);
-    const labels = ["recommendation", "research", "data health"];
-    const load_errors = results.flatMap((result, index) => result.status === "rejected"
-      ? [`Unable to load ${labels[index]}: ${result.reason instanceof Error ? result.reason.message : "request failed"}`]
-      : []);
-    const value = (index: number): unknown => results[index].status === "fulfilled" ? results[index].value : undefined;
-    return {
-      load_errors,
-      play_now: value(0) as RecordValue | undefined,
-      research_next: value(1) as RecordValue | Json[] | undefined,
-      evidence_health: value(2) as RecordValue | undefined,
-    };
-  },
+  advisor: (profileId: string) => request<AdvisorSnapshotState>(`/profiles/${encodeURIComponent(profileId)}/advisor`),
+  refreshAdvisor: (profileId: string) => request<AdvisorSnapshotState>(`/profiles/${encodeURIComponent(profileId)}/advisor/refresh`, { method: "POST" }),
   garage: (profileId: string) => request<RecordValue>(`/profiles/${encodeURIComponent(profileId)}/progress`),
   updateStatus: (profileId: string, vehicleId: string, status: string, expectedRevision?: string | number) =>
     request<RecordValue>(`/profiles/${encodeURIComponent(profileId)}/vehicles/${encodeURIComponent(vehicleId)}`, {

@@ -373,6 +373,25 @@ def _m2_roles(
     return frozenset(roles)
 
 
+def resolve_roles(
+    vehicle: Vehicle,
+    *,
+    capability_resolutions: CapabilityResolutionMap | None = None,
+    ruleset: Ruleset | None = None,
+) -> frozenset[Role]:
+    """Roles as the active ruleset sees them.
+
+    M2 requires a verified-present capability before granting a capability-derived role;
+    the legacy ruleset infers from raw capability membership. Callers outside the rule
+    evaluator (preference ranking) must not hard-code either behaviour.
+    """
+
+    config = _ruleset(ruleset)
+    if config.ruleset_id == "m2-capability-aware-v1":
+        return _m2_roles(vehicle, capability_resolutions)
+    return infer_roles(vehicle)
+
+
 def anti_air_rule(
     vehicles: Sequence[Vehicle],
     nearby_spaa: Sequence[tuple[Vehicle, VehicleStatus]] = (),
@@ -1208,6 +1227,34 @@ def _readiness_failures(
     return tuple(failures)
 
 
+def _combine_statistical_rules(
+    vehicles: Sequence[Vehicle],
+    cache: Mapping[str, RuleResult],
+    config: Ruleset,
+) -> RuleResult:
+    """Combine context-independent per-vehicle statistical evidence exactly."""
+    ordered = sorted(vehicles, key=lambda row: row.vehicle_id)
+    parts = [cache[vehicle.vehicle_id] for vehicle in ordered]
+    observed = any(part.score is not None for part in parts)
+    score = fmean(part.effective_score for part in parts) if observed else None
+    evidence = {
+        vehicle.vehicle_id: cache[vehicle.vehicle_id].evidence["vehicles"][vehicle.vehicle_id]
+        for vehicle in sorted(vehicles, key=lambda row: row.vehicle_id)
+    }
+    return RuleResult(
+        rule="statistical_strength",
+        score=score,
+        effective_score=score if score is not None else config.statistics.neutral_score,
+        status=_status(score, config) if score is not None else RuleStatus.UNKNOWN,
+        evidence={"vehicles": evidence, "missing_is_neutral_only_in_composite": True},
+        warnings=("statistics missing or incompatible",)
+        if any(part.warnings for part in parts) else (),
+        explanation=(
+            "Metrics are peer-relative after sample-size shrinkage; missing evidence stays null."
+        ),
+    )
+
+
 def evaluate_lineup_rules(
     vehicles: Sequence[Vehicle],
     resolved_brs: Mapping[str, int],
@@ -1222,6 +1269,7 @@ def evaluate_lineup_rules(
     evaluation_date: date | None = None,
     source_providers: Mapping[str, str] | None = None,
     source_purposes: Mapping[str, str] | None = None,
+    statistical_rule_cache: Mapping[str, RuleResult] | None = None,
 ) -> RulesEvaluation:
     """Evaluate each transparent component, composite score, and readiness gates."""
 
@@ -1245,11 +1293,15 @@ def evaluate_lineup_rules(
         uptier_resilience_rule(
             vehicles, config, capability_resolutions=capability_resolutions
         ),
-        statistical_strength_rule(
-            vehicles, resolved_brs, statistics_by_vehicle, peer_statistics, config,
-            evaluation_date=evaluation_date,
-            source_providers=source_providers,
-            source_purposes=source_purposes,
+        (
+            _combine_statistical_rules(vehicles, statistical_rule_cache, config)
+            if statistical_rule_cache is not None
+            else statistical_strength_rule(
+                vehicles, resolved_brs, statistics_by_vehicle, peer_statistics, config,
+                evaluation_date=evaluation_date,
+                source_providers=source_providers,
+                source_purposes=source_purposes,
+            )
         ),
     )
     rules: tuple[RuleResult, ...] = base_rules

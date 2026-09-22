@@ -32,6 +32,8 @@ wt-advisor profile reconcile --profile acceptance --dry-run --json
 wt-advisor acceptance --milestone 1
 wt-advisor acceptance --milestone 2 --json
 wt-advisor-mcp
+wt-advisor advisor show --json
+wt-advisor advisor refresh --json
 ```
 
 ## MCP tunnel
@@ -85,6 +87,22 @@ documented in [acceptance-m2.md](docs/acceptance-m2.md).
 ## Local dashboard
 
 Run `wt-advisor dashboard` to serve the bundled dashboard at `http://127.0.0.1:8765`.
+The dashboard loads garage/progression independently of the advisor calculation. On first open,
+or after garage, saved context, selected preset, evidence, or recommendation-policy changes, it
+shows a visibly stale last answer while recomputing in a separate request. A failed refresh
+retains the old answer and offers retry. The recommendation and research reasons are
+deterministic; MCP and ChatGPT are not required.
+
+Profile-specific preferred roles and duplicate-role avoidance can be saved in dashboard context.
+Readiness and battle-rating frontier selection stay authoritative: preferences only order the
+readiness-passing lineups at the already-selected BR, and objective lineup scores are never
+modified. `duplicate_role_penalty` is a 0–10 **avoidance strength**, not a number of score
+points: 0 disables the term and 10 applies the strongest available avoidance. Preferences are
+bounded — they can overcome at most 3.0 points of objective evaluation, so a clearly stronger
+lineup still wins. The card explains the recommendation in plain language and keeps every reason
+code, metric and provenance field in its details view. A preference that no ready lineup at the
+selected BR can satisfy is reported as a tradeoff, together with the ranked research target that
+would change it. See [docs/architecture.md](docs/architecture.md) for the full semantics.
 The dashboard is packaged with the Python distribution; it does not need Vite at runtime.
 For frontend development and rebuilding its assets, use Node.js 22.22.2 (the supported range is
 `^22.22.2`).

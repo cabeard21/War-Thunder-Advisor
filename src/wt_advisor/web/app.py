@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 import os
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -10,8 +13,10 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from wt_advisor.domain.models import VehicleStatus
+from wt_advisor.domain.models import Role, VehicleStatus
 from wt_advisor.services.advisor import AdvisorService
+
+LOGGER = logging.getLogger(__name__)
 
 
 class PresetInput(BaseModel):
@@ -28,6 +33,8 @@ class ContextInput(BaseModel):
     target_br: int | None = None
     required_vehicle_ids: list[str] = Field(default_factory=list)
     excluded_vehicle_ids: list[str] = Field(default_factory=list)
+    preferred_roles: list[Role] | None = None
+    duplicate_role_penalty: int | None = Field(default=None, ge=0, le=10)
 
 
 class StatusInput(BaseModel):
@@ -49,6 +56,23 @@ def create_app(service: AdvisorService | None = None) -> FastAPI:
     resolved = service or AdvisorService.from_database(
         Path(os.environ.get("WT_ADVISOR_DB", "wt-advisor.sqlite"))
     )
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="advisor-refresh")
+    refreshes: dict[str, Future[dict[str, Any]]] = {}
+    refresh_lock = Lock()
+
+    def advisor_state(profile_id: str) -> dict[str, Any]:
+        state = resolved.get_advisor_snapshot(profile_id)
+        with refresh_lock:
+            future = refreshes.get(profile_id)
+        if future is None:
+            return state
+        if not future.done():
+            return {**state, "status": "computing"}
+        error = future.exception()
+        if error is not None:
+            LOGGER.error("Advisor refresh failed for profile %s", profile_id, exc_info=error)
+            return {**state, "status": "failed", "error": "Advisor refresh failed; retry."}
+        return state
 
     @app.exception_handler(ValueError)
     async def domain_error(_: Request, exc: ValueError) -> JSONResponse:
@@ -161,6 +185,21 @@ def create_app(service: AdvisorService | None = None) -> FastAPI:
     @app.get("/api/profiles/{profile_id}/progress")
     def progress(profile_id: str) -> dict[str, Any]:
         return {"data": _dump(resolved.get_user_progress(profile_id))}
+
+    @app.get("/api/profiles/{profile_id}/advisor")
+    def advisor_snapshot(profile_id: str) -> dict[str, Any]:
+        return {"data": advisor_state(profile_id)}
+
+    @app.post("/api/profiles/{profile_id}/advisor/refresh")
+    def refresh_advisor_snapshot(profile_id: str) -> dict[str, Any]:
+        resolved.get_user_progress(profile_id)
+        with refresh_lock:
+            future = refreshes.get(profile_id)
+            if future is None or future.done():
+                refreshes[profile_id] = executor.submit(
+                    resolved.refresh_advisor_snapshot, profile_id
+                )
+        return {"data": advisor_state(profile_id)}
 
     @app.patch("/api/profiles/{profile_id}/vehicles/{vehicle_id}")
     def set_status(profile_id: str, vehicle_id: str, body: StatusInput) -> dict[str, Any]:

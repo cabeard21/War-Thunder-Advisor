@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { AdvisorApiError, api, displayError } from "./api";
-import type { CommunityRefreshResult, DashboardState, Json, Preset, RecordValue, Vehicle } from "./types";
+import type { AdvisorExplanation, AdvisorPreferenceFactors, AdvisorPreferenceTransparency, AdvisorSnapshotState, CommunityRefreshResult, DashboardState, Json, Preset, RecordValue, Vehicle } from "./types";
 import { vehicleName } from "./vehicle-name";
 
 const statuses = ["owned", "unlocked_not_purchased", "researching", "available_to_research", "locked", "unknown"];
@@ -50,6 +50,8 @@ export function AdvisorApp() {
   const [required, setRequired] = useState<string[]>([]);
   const [excluded, setExcluded] = useState<string[]>([]);
   const [targetBr, setTargetBr] = useState<string>("");
+  const [preferredRoles, setPreferredRoles] = useState("");
+  const [duplicateRolePenalty, setDuplicateRolePenalty] = useState("0");
   const [filter, setFilter] = useState("");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
@@ -60,7 +62,33 @@ export function AdvisorApp() {
   const [pendingStatuses, setPendingStatuses] = useState<Record<string, string>>({});
   const [lastEvaluatedLineup, setLastEvaluatedLineup] = useState<string[]>([]);
   const [communityRefresh, setCommunityRefresh] = useState<CommunityRefreshResult>();
+  const [advisor, setAdvisor] = useState<AdvisorSnapshotState>();
   const refreshSequence = useRef(0);
+  const advisorSequence = useRef(0);
+
+  const loadAdvisor = async (requestedProfile: string, autoRefresh = true) => {
+    const sequence = ++advisorSequence.current;
+    try {
+      const result = await api.advisor(requestedProfile);
+      if (sequence !== advisorSequence.current) return;
+      setAdvisor(result);
+      if (autoRefresh && (result.status === "missing" || result.status === "stale")) {
+        const started = await api.refreshAdvisor(requestedProfile);
+        if (sequence === advisorSequence.current) setAdvisor({ ...started, snapshot: started.snapshot ?? result.snapshot, stale_reasons: started.stale_reasons.length ? started.stale_reasons : result.stale_reasons });
+      }
+    } catch (caught) {
+      if (sequence === advisorSequence.current) {
+        const message = displayError(caught);
+        setError(`Unable to load advisor snapshot: ${message}`);
+        setAdvisor((current) => ({ status: "failed", snapshot: current?.snapshot ?? null, stale_reasons: current?.stale_reasons ?? [], error: message }));
+      }
+    }
+  };
+
+  const retryAdvisor = async () => {
+    try { const started = await api.refreshAdvisor(profileId); setAdvisor((current) => ({ ...started, snapshot: started.snapshot ?? current?.snapshot ?? null })); }
+    catch (caught) { setError(`Unable to refresh advisor snapshot: ${displayError(caught)}`); }
+  };
 
   const refresh = async () => {
     const sequence = ++refreshSequence.current;
@@ -74,20 +102,21 @@ export function AdvisorApp() {
       setRequired(list(context.required_vehicle_ids));
       setExcluded(list(context.excluded_vehicle_ids));
       setTargetBr(typeof context.target_br === "number" ? String(context.target_br / 10) : "");
-      void api.dashboardInsights(profileId).then((insights) => {
-        if (sequence !== refreshSequence.current) return;
-        setState((current) => current ? { ...current, ...insights, load_errors: [...(next.load_errors ?? []), ...(insights.load_errors ?? [])] } : current);
-        if (insights.load_errors?.length) setError([...(next.load_errors ?? []), ...insights.load_errors].join(" "));
-      }).catch((caught) => {
-        if (sequence === refreshSequence.current) setError(`Unable to load dashboard insights: ${displayError(caught)}`);
-      });
+      setPreferredRoles(list(context.preferred_roles).join(", "));
+      setDuplicateRolePenalty(typeof context.duplicate_role_penalty === "number" ? String(context.duplicate_role_penalty) : "0");
+      void loadAdvisor(profileId);
     } catch (caught) {
       if (sequence === refreshSequence.current) setError(displayError(caught));
     } finally {
       if (sequence === refreshSequence.current) setBusy(false);
     }
   };
-  useEffect(() => { void refresh(); }, [profileId]);
+  useEffect(() => { ++advisorSequence.current; setAdvisor(undefined); void refresh(); }, [profileId]);
+  useEffect(() => {
+    if (advisor?.status !== "computing") return;
+    const timer = window.setTimeout(() => { void loadAdvisor(profileId, false); }, 1500);
+    return () => window.clearTimeout(timer);
+  }, [advisor?.status, advisor?.snapshot, profileId]);
 
   const refreshCommunityEvidence = async () => {
     setBusy(true); setError(""); setNotice("");
@@ -110,7 +139,7 @@ export function AdvisorApp() {
   const names = useMemo(() => new Map((state?.vehicles ?? []).map((vehicle) => [vehicle.vehicle_id, title(vehicle)])), [state]);
   const vehicleName = (id: string) => names.get(id) ?? id;
   const slots = Number(asRecord(state?.profile).crew_slots ?? 5);
-  const recommendedAnalysis = asRecord(asRecord(asRecord(state?.play_now).recommended).analysis);
+  const recommendedAnalysis = asRecord(advisor?.snapshot?.primary_lineup?.analysis);
   const generatedLineup = list(asRecord(recommendedAnalysis.lineup).slots);
   const evaluatedLineup = list(asRecord(asRecord(state?.play_now).lineup).slots);
   const playNowLineup = generatedLineup.length
@@ -145,6 +174,8 @@ export function AdvisorApp() {
     required_vehicle_ids: required, excluded_vehicle_ids: excluded,
     target_br: targetBr ? Math.round(Number(targetBr) * 10) : null,
     selected_preset_id: asRecord(state?.context).selected_preset_id ?? null,
+    preferred_roles: [...new Set(preferredRoles.split(",").map((role) => role.trim()).filter(Boolean))],
+    duplicate_role_penalty: Number(duplicateRolePenalty),
   }), "Constraints applied. Saved presets were not changed.");
   const selectContext = (presetId: string) => mutate(async () => {
     const context = await api.updateContext(profileId, {
@@ -153,6 +184,8 @@ export function AdvisorApp() {
       excluded_vehicle_ids: excluded,
       target_br: targetBr ? Math.round(Number(targetBr) * 10) : null,
       selected_preset_id: presetId,
+      preferred_roles: [...new Set(preferredRoles.split(",").map((role) => role.trim()).filter(Boolean))],
+      duplicate_role_penalty: Number(duplicateRolePenalty),
     });
     setState((old) => old ? { ...old, context: context as DashboardState["context"] } : old);
   }, "Selected preset saved as the active context.");
@@ -204,6 +237,8 @@ export function AdvisorApp() {
     {error && <section className="alert error" role="alert"><strong>Request needs attention.</strong> {error}<button onClick={() => setError("")}>Dismiss</button></section>}
     {notice && <section className="alert success" role="status">{notice}<button onClick={() => setNotice("")}>Dismiss</button></section>}
     <section className="command-strip"><label>Target BR <input inputMode="decimal" value={targetBr} onChange={(e) => setTargetBr(e.target.value)} placeholder="e.g. 3.7" /></label>
+      <label>Preferred roles, in order <input aria-label="Preferred roles, in order" value={preferredRoles} onChange={(e) => setPreferredRoles(e.target.value)} placeholder="tank_destroyer, spaa" /></label>
+      <label>Duplicate-role penalty <input aria-label="Duplicate-role penalty" type="number" min="0" max="10" step="1" value={duplicateRolePenalty} onChange={(e) => setDuplicateRolePenalty(e.target.value)} /></label>
       <span>{required.length} pins · {excluded.length} exclusions · {draft.length}/{slots} draft slots</span>
       <button onClick={() => void saveContext()} disabled={busy}>Apply constraints</button><button className="accent" onClick={() => void evaluate()} disabled={busy || !draft.length}>Evaluate draft</button></section>
     <div className="layout">
@@ -217,14 +252,14 @@ export function AdvisorApp() {
           <button className={excluded.includes(vehicle.vehicle_id) ? "marked" : ""} onClick={() => toggleConstraint(vehicle.vehicle_id, "excluded")}>Exclude</button>
         </article>)}</div></section>
       <aside className="side-stack">
-        <section className="panel"><p className="eyebrow">PLAY NOW</p><h2>Ready frontier</h2><Result value={state?.play_now} empty="Refresh to load the active recommendation." vehicleName={vehicleName} /></section>
+        <section className="panel"><p className="eyebrow">PLAY NOW</p><h2>Ready frontier</h2><AdvisorPanel advisor={advisor} vehicleName={vehicleName} onRetry={() => void retryAdvisor()} /></section>
         <section className="panel"><p className="eyebrow">BUILDER</p><h2>Visible draft</h2><ol className="slots">{Array.from({ length: slots }, (_, index) => <li key={index}>{draft[index] ? vehicleName(draft[index]) : <em>Empty crew slot</em>}</li>)}</ol><p className="muted">Pins and exclusions are hard constraints. Suggestions never overwrite this draft.</p><Detail value={{ draft, required, excluded, target_br: targetBr }} /></section>
         <section className="panel"><p className="eyebrow">COMPARE</p><h2>Alternative check</h2><button onClick={() => void mutate(async () => setComparison(await api.compare(profileId, { lineup_a: draft, lineup_b: playNowLineup.slice(0, slots) })), "Comparison refreshed.")} disabled={draft.length === 0}>Compare draft / play now</button>{comparison && <Result value={comparison} empty="" vehicleName={vehicleName} />}</section>
       </aside>
     </div>
     <section className="lower-grid">
       <section className="panel"><p className="eyebrow">PRESETS</p><h2>Saved lineup intent</h2><form onSubmit={(event) => void savePreset(event)} className="preset-form"><input required name="preset-name" maxLength={80} value={presetName} onChange={(event) => setPresetName(event.target.value)} placeholder="New preset name" aria-label="Preset name" /><button className="accent">{editingPreset ? "Save changes" : "Save draft"}</button>{editingPreset && <button type="button" onClick={() => { setEditingPreset(undefined); setPresetName(""); }}>Cancel edit</button>}</form><PresetList presets={state?.presets ?? []} profileId={profileId} selectedPresetId={typeof asRecord(state?.context).selected_preset_id === "string" ? asRecord(state?.context).selected_preset_id as string : undefined} vehicleName={vehicleName} onSelect={(preset) => void selectContext(preset.preset_id)} onLoad={(preset) => { setDraft(preset.slots); setRequired(preset.required_vehicle_ids ?? []); setExcluded(preset.excluded_vehicle_ids ?? []); setNotice(`Loaded ${preset.name}; apply or save explicitly.`); }} onEdit={(preset) => { setEditingPreset(preset); setPresetName(preset.name); setDraft(preset.slots); setRequired(preset.required_vehicle_ids ?? []); setExcluded(preset.excluded_vehicle_ids ?? []); setNotice(`Editing ${preset.name}; save explicitly to update it.`); }} onDelete={(preset) => void mutate(async () => { await api.deletePreset(profileId, preset.preset_id, preset.revision); setState((old) => old ? { ...old, presets: (old.presets ?? []).filter((item) => item.preset_id !== preset.preset_id) } : old); }, "Preset deleted.")} /></section>
-      <section className="panel"><p className="eyebrow">RESEARCH NEXT</p><h2>One-step unlock evidence</h2><Result value={state?.research_next} empty="No unlock evaluations are currently available." vehicleName={vehicleName} /></section>
+      <section className="panel"><p className="eyebrow">RESEARCH NEXT</p><h2>Ranked unlocks</h2><ResearchPanel advisor={advisor} vehicleName={vehicleName} /></section>
       <section className="panel"><p className="eyebrow">DATA HEALTH</p><h2>Evidence boundaries</h2><EvidenceHealth value={state?.evidence_health} />{communityRefresh && <><p>Community refresh: {communityRefresh.outcome}. Statistics: {communityRefresh.statistics_status ?? "unknown"}; {communityRefresh.accepted_statistics_rows ?? 0} accepted, {communityRefresh.quarantined_statistics_rows ?? 0} quarantined, {communityRefresh.eligible_statistics_rows ?? 0} scoring-eligible. Bundle: {communityRefresh.bundle_id ?? "unchanged"}.</p>{communityRefresh.source_observation_date && <p className="muted">Community statistics observed {communityRefresh.source_observation_date} ({communityRefresh.statistics_age_days ?? "?"} days old). {communityRefresh.statistics_limitations}</p>}</>}</section>
     </section>
   </main>;
@@ -245,6 +280,94 @@ function EvidenceHealth({ value }: { value: unknown }) {
     <p>When evidence is missing, 50 is a neutral composite contribution, not an observed vehicle score or verified capability. Uptier resilience is a proxy; inspect its unknown inputs.</p>
     <Detail value={value} />
   </div>;
+}
+
+function reasonLabel(reason: string): string {
+  return reason.replaceAll("_", " ");
+}
+
+/** Player-facing wording. The backend generates it deterministically from the reason codes. */
+function Explanation({ explanation, vehicleName }: { explanation?: AdvisorExplanation; vehicleName: (id: string) => string }) {
+  if (!explanation) return null;
+  const pointer = explanation.research_pointer;
+  // The backend has no display names in this dataset, so re-render its pointer sentence here.
+  const tradeoffs = pointer
+    ? explanation.tradeoffs.map((line) => line.includes(pointer) ? line.replaceAll(pointer, vehicleName(pointer)) : line)
+    : explanation.tradeoffs;
+  return <div className="advisor-explanation">
+    {explanation.strengths.length > 0 && <><h4>Why this lineup</h4><ul className="advisor-strengths">{explanation.strengths.map((line) => <li key={line}>{line}</li>)}</ul></>}
+    {tradeoffs.length > 0 && <><h4>Tradeoffs</h4><ul className="advisor-tradeoffs">{tradeoffs.map((line) => <li key={line}>{line}</li>)}</ul></>}
+    {explanation.warnings.length > 0 && <><h4>Warnings</h4><ul className="advisor-warnings">{explanation.warnings.map((line) => <li key={line}>{line}</li>)}</ul></>}
+    <p className="advisor-evidence-summary">{explanation.evidence_summary.summary}</p>
+  </div>;
+}
+
+/** Answers "did my preferences affect this?" without reading source code. */
+function PreferenceMaths({ factors, transparency, vehicleName }: { factors?: AdvisorPreferenceFactors; transparency?: AdvisorPreferenceTransparency; vehicleName: (id: string) => string }) {
+  if (!factors) return null;
+  const first = asRecord(transparency?.objective_first_choice);
+  return <div className="preference-maths">
+    <strong>Preference calculation</strong>
+    <ul>
+      <li>Objective evaluation: {factors.objective_score.toFixed(3)}</li>
+      <li>Preferred roles: {factors.role_component >= 0 ? "+" : ""}{factors.role_component.toFixed(3)} (cap {factors.role_cap})</li>
+      <li>Duplicate roles: {factors.duplicate_component.toFixed(3)} (cap −{factors.duplicate_cap}, avoidance strength {factors.duplicate_role_penalty}/10)</li>
+      <li>Preference adjustment: {factors.preference_adjustment >= 0 ? "+" : ""}{factors.preference_adjustment.toFixed(3)}</li>
+      <li>Recommendation score: {factors.recommendation_score.toFixed(3)}</li>
+      <li>Most preferences can ever overcome: {factors.max_preference_swing} points</li>
+      {typeof transparency?.candidate_pool_size === "number" && <li>Ready lineups compared at this BR: {transparency.candidate_pool_size}</li>}
+      <li>Did preferences change the recommendation? {transparency?.preference_changed_selection ? "Yes" : "No"}</li>
+      {transparency?.preference_changed_selection && Array.isArray(first.slots) && <li>Without preferences: {list(first.slots).map(vehicleName).join(" · ")}</li>}
+    </ul>
+  </div>;
+}
+
+function AdvisorPanel({ advisor, vehicleName, onRetry }: { advisor?: AdvisorSnapshotState; vehicleName: (id: string) => string; onRetry: () => void }) {
+  if (!advisor) return <p className="muted">Loading saved advisor result…</p>;
+  const snapshot = advisor.snapshot;
+  const primary = snapshot?.primary_lineup;
+  const analysis = asRecord(primary?.analysis);
+  const lineup = list(asRecord(analysis.lineup).slots);
+  return <div className="result">
+    <p className={`advisor-status ${advisor.status}`} aria-live="polite">{advisor.status === "current" ? "Current recommendation" : advisor.status === "computing" ? "Computing recommendation…" : advisor.status === "stale" ? "Stale recommendation — refreshing" : advisor.status === "failed" ? "Recomputation failed" : "No saved recommendation yet — computing"}</p>
+    {advisor.stale_reasons.length > 0 && <p>Changed: {advisor.stale_reasons.map(reasonLabel).join(", ")}</p>}
+    {advisor.error && <p className="not-ready">{advisor.error}</p>}
+    {advisor.status === "failed" && <button onClick={onRetry}>Retry advisor</button>}
+    {primary ? <>
+      <p>{analysis.readiness_passed === true ? <strong className="ready">READY</strong> : <strong className="not-ready">NOT READY</strong>} {typeof snapshot?.recommended_br === "number" && <> BR {br(snapshot.recommended_br)}</>}</p>
+      <p className="advisor-lineup">{lineup.map(vehicleName).join(" · ") || "No ready lineup"}</p>
+      <Explanation explanation={primary.explanation} vehicleName={vehicleName} />
+      <details className="advisor-details">
+        <summary>Reason codes, evidence and preference maths</summary>
+        {primary.reasons.length > 0 && <p className="reason-codes">{primary.reasons.join(" · ")}</p>}
+        <PreferenceMaths factors={primary.preference_factors} transparency={snapshot?.preference_transparency} vehicleName={vehicleName} />
+        <StatisticsEvidence analysis={analysis} vehicleName={vehicleName} />
+      </details>
+    </> : <p className="muted">No ready lineup is available.</p>}
+    {(snapshot?.alternative_lineups ?? []).length > 0 && <><h3>Alternatives</h3><ol className="advisor-alternatives">{snapshot?.alternative_lineups.map((alternative, index) => {
+      const altAnalysis = asRecord(alternative.analysis);
+      return <li key={index}>
+        <p className="advisor-lineup">{list(asRecord(altAnalysis.lineup).slots).map(vehicleName).join(" · ")}</p>
+        <p className="muted">{altAnalysis.readiness_passed === true ? "Ready" : "Not ready"}{typeof altAnalysis.lineup_br === "number" && <> · BR {br(altAnalysis.lineup_br)}</>}</p>
+        {(alternative.differentiation?.differences ?? []).length > 0 && <ul className="advisor-tradeoffs">{alternative.differentiation?.differences.map((line) => <li key={line}>{line}</li>)}</ul>}
+        <details><summary>Reason codes</summary><p className="reason-codes">{alternative.reasons.join(" · ")}</p></details>
+      </li>;
+    })}</ol></>}
+    {(snapshot?.blockers ?? []).length > 0 && <><h3>Readiness blockers</h3><ul>{snapshot?.blockers.map((item) => <li key={item}>{reasonLabel(item)}</li>)}</ul></>}
+    {(snapshot?.data_gaps ?? []).length > 0 && <><h3>Evidence gaps</h3><ul>{snapshot?.data_gaps.map((item) => <li key={item}>{reasonLabel(item)}</li>)}</ul></>}
+    {snapshot?.generated_at && <small>Generated {snapshot.generated_at}</small>}
+    {snapshot && <Detail value={snapshot} />}
+  </div>;
+}
+
+function ResearchPanel({ advisor, vehicleName }: { advisor?: AdvisorSnapshotState; vehicleName: (id: string) => string }) {
+  const priorities = advisor?.snapshot?.research_priorities ?? [];
+  if (!priorities.length) return <p className="muted">No directly researchable targets in this snapshot.</p>;
+  return <ol className="research-priorities">{priorities.map((priority) => <li key={priority.vehicle_id}>
+    <strong>{vehicleName(priority.vehicle_id)}</strong> {priority.recovery_target && <span className="not-ready">Recovery target</span>}
+    {priority.reasons.length > 0 && <p>Why: {priority.reasons.map(reasonLabel).join(" · ")}</p>}
+    {(priority.expanded_lineup || priority.ranking_factors) && <Detail value={{ ranking_factors: priority.ranking_factors, research_cost: priority.research_cost, resulting_br: priority.resulting_br, resolved_blockers: priority.resolved_blockers, expanded_lineup: priority.expanded_lineup }} />}
+  </li>)}</ol>;
 }
 
 function Result({ value, empty, vehicleName }: { value: unknown; empty: string; vehicleName: (id: string) => string }) {

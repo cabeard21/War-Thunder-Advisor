@@ -69,6 +69,8 @@ from wt_advisor.domain.models import (
     ResearchEdge,
     ResearchEdgeType,
     ResolvedAvailability,
+    Role,
+    RuleResult,
     RuleStatus,
     SnapshotPurpose,
     SnapshotRef,
@@ -94,6 +96,7 @@ from wt_advisor.rules import (
     evaluate_lineup_rules,
     infer_roles,
     load_ruleset,
+    statistical_strength_rule,
     statistics_eligibility,
 )
 from wt_advisor.storage import EvidenceRepository, create_database
@@ -146,6 +149,10 @@ class AdvisorService:
         }
         self._profile = profile
         self._statuses = dict(vehicle_statuses)
+        self._lineup_cache: dict[tuple[str, ...], LineupAnalysis] | None = None
+        self._advisor_scoring_statistics: dict[str, VehicleStatistics] | None = None
+        self._advisor_peer_statistics: tuple[PeerStatistic, ...] | None = None
+        self._advisor_statistical_rule_cache: dict[str, RuleResult] | None = None
         self._research_edges = tuple(research_edges)
         self._ruleset = ruleset or load_ruleset()
         self._evaluation_date = evaluation_date or date.today()
@@ -1517,6 +1524,58 @@ class AdvisorService:
             raise LookupError(f"unknown profile {profile_id!r}")
         return f"write-rev-{stored.write_revision}"
 
+    def compute_advisor_snapshot(self, profile_id: str) -> dict[str, Any]:
+        """Compute a complete deterministic answer from one captured profile state."""
+        from wt_advisor.services.recommendations import compute_snapshot
+
+        return compute_snapshot(self, profile_id)
+
+    def get_advisor_snapshot(self, profile_id: str) -> dict[str, Any]:
+        """Read the latest answer without recomputing and expose stale inputs."""
+        from wt_advisor.services.recommendations import capture_inputs
+
+        repository = self._repository_required()
+        _, _, fingerprint, revisions = capture_inputs(self, profile_id)
+        resolved_profile = self._resolve_profile_id(profile_id)
+        latest = repository.get_latest_advisor_snapshot(
+            resolved_profile, fingerprint=fingerprint
+        ) or repository.get_latest_advisor_snapshot(resolved_profile)
+        if latest is None:
+            return {"status": "missing", "snapshot": None, "stale_reasons": [], "error": None}
+        stale = latest.result_payload.get("source_fingerprint") != fingerprint
+        previous = latest.result_payload.get("source_revisions", {})
+        reasons = [
+            f"{key}_changed" for key, revision in revisions.items()
+            if previous.get(key) != revision
+        ] if stale else []
+        return {
+            "status": "stale" if stale else "current",
+            "snapshot": latest.result_payload,
+            "stale_reasons": reasons or (["advisor_inputs_changed"] if stale else []),
+            "error": None,
+        }
+
+    def refresh_advisor_snapshot(self, profile_id: str) -> dict[str, Any]:
+        """Persist a historical answer; a concurrent input change leaves it stale."""
+        repository = self._repository_required()
+        snapshot = self.compute_advisor_snapshot(profile_id)
+        repository.store_evaluation(
+            evaluation_id=uuid4().hex,
+            profile_id=self._resolve_profile_id(profile_id),
+            kind="advisor_snapshot",
+            profile_revision=snapshot["source_fingerprint"],
+            profile_state={"profile_id": snapshot["profile_id"]},
+            effective_inputs={"source_fingerprint": snapshot["source_fingerprint"]},
+            evidence_context=snapshot["evidence_context"],
+            ruleset_hash=snapshot["evidence_context"]["ruleset_hash"],
+            schema_revision=snapshot["evidence_context"]["schema_revision"],
+            result_id=stable_hash({
+                key: value for key, value in snapshot.items() if key != "generated_at"
+            }),
+            result_payload=snapshot,
+        )
+        return self.get_advisor_snapshot(profile_id)
+
     def evaluate_and_store(
         self,
         *,
@@ -1838,8 +1897,14 @@ class AdvisorService:
         required_vehicle_ids: Sequence[str] = (),
         excluded_vehicle_ids: Sequence[str] = (),
         expected_revision: str,
+        preferred_roles: Sequence[Role] | None = None,
+        duplicate_role_penalty: int | None = None,
     ) -> Any:
         self._validate_preset((), required_vehicle_ids, excluded_vehicle_ids)
+        if preferred_roles is not None and len(set(preferred_roles)) != len(preferred_roles):
+            raise ValueError("preferred roles must be unique")
+        if duplicate_role_penalty is not None and not 0 <= duplicate_role_penalty <= 10:
+            raise ValueError("duplicate role penalty must be between 0 and 10")
         return self._repository_required().update_advisor_context(
             self._resolve_profile_id(profile_id),
             selected_preset_id=selected_preset_id,
@@ -1847,6 +1912,8 @@ class AdvisorService:
             required_vehicle_ids=tuple(sorted(required_vehicle_ids)),
             excluded_vehicle_ids=tuple(sorted(excluded_vehicle_ids)),
             expected_revision=expected_revision,
+            preferred_roles=None if preferred_roles is None else tuple(preferred_roles),
+            duplicate_role_penalty=duplicate_role_penalty,
         )
 
     def analyze_lineup(self, vehicle_ids: Sequence[str]) -> LineupAnalysis:
@@ -1875,21 +1942,43 @@ class AdvisorService:
             if self._capability_resolutions
             else None
         )
+        scoring_statistics = (
+            self._advisor_scoring_statistics
+            if self._advisor_scoring_statistics is not None else self._scoring_statistics()
+        )
+        peers = (
+            self._advisor_peer_statistics
+            if self._advisor_peer_statistics is not None else self._peer_statistics()
+        )
+        source_providers = {
+            item.snapshot_id: item.provider for item in self._evidence_context.snapshots
+        }
+        source_purposes = {
+            item.snapshot_id: item.purpose.value for item in self._evidence_context.snapshots
+        }
+        statistical_cache = self._advisor_statistical_rule_cache
+        if statistical_cache is not None:
+            for vehicle in vehicles:
+                if vehicle.vehicle_id not in statistical_cache:
+                    statistical_cache[vehicle.vehicle_id] = statistical_strength_rule(
+                        (vehicle,), {vehicle.vehicle_id: resolved_brs[vehicle.vehicle_id]},
+                        scoring_statistics, peers, self._ruleset,
+                        evaluation_date=self._evaluation_date,
+                        source_providers=source_providers,
+                        source_purposes=source_purposes,
+                    )
         evaluation = evaluate_lineup_rules(
             vehicles,
             resolved_brs,
-            statistics_by_vehicle=self._scoring_statistics(),
-            peer_statistics=self._peer_statistics(),
+            statistics_by_vehicle=scoring_statistics,
+            peer_statistics=peers,
             nearby_spaa=nearby_spaa,
             capability_resolutions=capability_evidence,
             ruleset=self._ruleset,
             evaluation_date=self._evaluation_date,
-            source_providers={
-                item.snapshot_id: item.provider for item in self._evidence_context.snapshots
-            },
-            source_purposes={
-                item.snapshot_id: item.purpose.value for item in self._evidence_context.snapshots
-            },
+            source_providers=source_providers,
+            source_purposes=source_purposes,
+            statistical_rule_cache=statistical_cache,
         )
         warnings = tuple(
             dict.fromkeys(
@@ -1967,7 +2056,12 @@ class AdvisorService:
         for vehicle_ids in combinations(eligible, slot_count):
             if required and not required.issubset(vehicle_ids):
                 continue
-            analysis = self.analyze_lineup(vehicle_ids)
+            cache = self._lineup_cache
+            analysis = None if cache is None else cache.get(vehicle_ids)
+            if analysis is None:
+                analysis = self.analyze_lineup(vehicle_ids)
+                if cache is not None and len(cache) < 5_000:
+                    cache[vehicle_ids] = analysis
             if target_br is not None and analysis.lineup_br != target_br:
                 continue
             grouped[analysis.lineup_br].append(CandidateLineup(analysis=analysis))

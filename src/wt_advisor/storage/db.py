@@ -12,7 +12,18 @@ from alembic.config import Config
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from alembic.util.exc import CommandError
-from sqlalchemy import Column, Engine, String, Table, create_engine, event, inspect, text
+from sqlalchemy import (
+    JSON,
+    Column,
+    Engine,
+    Integer,
+    String,
+    Table,
+    create_engine,
+    event,
+    inspect,
+    text,
+)
 from sqlalchemy.engine import URL, Connection
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -80,26 +91,54 @@ def create_database(database: str | Path | URL = "wt-advisor.sqlite") -> Engine:
                     text("SELECT version_num FROM alembic_version")
                 ).scalar()
                 if version == "0007":
+                    _upgrade_packaged_0007_to_0008(connection)
                     return engine
                 if version == "0006":
                     _upgrade_packaged_0006_to_0007(connection)
+                    _upgrade_packaged_0007_to_0008(connection)
                     return engine
                 if version == "0005":
                     _upgrade_packaged_0005_to_0006(connection)
                     _upgrade_packaged_0006_to_0007(connection)
+                    _upgrade_packaged_0007_to_0008(connection)
                     return engine
                 if version == "0004":
                     _upgrade_packaged_0004_to_0005(connection)
                     _upgrade_packaged_0005_to_0006(connection)
                     _upgrade_packaged_0006_to_0007(connection)
+                    _upgrade_packaged_0007_to_0008(connection)
+                    return engine
+                if version == "0008":
                     return engine
                 raise
             Base.metadata.create_all(connection)
             connection.execute(
                 text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
             )
-            connection.execute(text("INSERT INTO alembic_version (version_num) VALUES ('0007')"))
+            connection.execute(text("INSERT INTO alembic_version (version_num) VALUES ('0008')"))
     return engine
+
+
+def _upgrade_packaged_0007_to_0008(connection: Connection) -> None:
+    """Apply advisor preference delta when migration scripts are absent."""
+
+    operations = Operations(MigrationContext.configure(connection))
+    operations.add_column(
+        "advisor_contexts",
+        Column("preferred_roles", JSON(), nullable=False, server_default="[]"),
+    )
+    operations.add_column(
+        "advisor_contexts",
+        Column("duplicate_role_penalty", Integer(), nullable=False, server_default="0"),
+    )
+    operations.create_index(
+        "ix_stored_evaluations_profile_kind_created",
+        "stored_evaluations",
+        ["profile_id", "kind", "created_at"],
+    )
+    connection.execute(
+        text("UPDATE alembic_version SET version_num = '0008' WHERE version_num = '0007'")
+    )
 
 
 def _upgrade_packaged_0004_to_0005(connection: Connection) -> None:

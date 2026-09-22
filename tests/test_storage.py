@@ -6,8 +6,10 @@ from pathlib import Path
 
 import pytest
 from alembic import command
+from alembic.util.exc import CommandError
 from sqlalchemy import Engine, func, inspect, select
 
+import wt_advisor.storage.db as storage_db
 from wt_advisor.data.models import RawCapabilityDataset
 from wt_advisor.data.providers.fixture import FixtureProvider
 from wt_advisor.domain.models import (
@@ -16,6 +18,7 @@ from wt_advisor.domain.models import (
     Freshness,
     GameMode,
     Nation,
+    Role,
     SnapshotRef,
     StatisticsScope,
     UserProfile,
@@ -854,7 +857,7 @@ def database(tmp_path: Path) -> tuple[Engine, EvidenceRepository]:
     return engine, EvidenceRepository(engine)
 
 
-def test_populated_0004_upgrades_to_0007_without_losing_profile(tmp_path: Path) -> None:
+def test_populated_0004_upgrades_to_0008_without_losing_profile(tmp_path: Path) -> None:
     database_path = tmp_path / "legacy.sqlite"
     engine = build_engine(database_path)
     command.upgrade(_alembic_config(engine), "0004")
@@ -873,8 +876,128 @@ def test_populated_0004_upgrades_to_0007_without_losing_profile(tmp_path: Path) 
     assert inspect(engine).has_table("stored_evaluations")
     with engine.connect() as connection:
         revision = connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar()
-        assert revision == "0007"
+        assert revision == "0008"
     engine.dispose()
+
+
+def test_0008_backfills_existing_advisor_context_preferences(tmp_path: Path) -> None:
+    engine = build_engine(tmp_path / "legacy-context.sqlite")
+    command.upgrade(_alembic_config(engine), "0007")
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO user_profiles "
+            "(profile_id, nation, preferred_mode, crew_slots, include_premiums, "
+            "include_event_vehicles, include_pack_vehicles, revision) "
+            "VALUES ('legacy', 'usa', 'ground_realistic', 5, 0, 0, 0, 0)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO advisor_contexts "
+            "(profile_id, selected_preset_id, target_br, required_vehicle_ids, "
+            "excluded_vehicle_ids, revision) "
+            "VALUES ('legacy', NULL, 50, '[]', '[]', 3)"
+        )
+    command.upgrade(_alembic_config(engine), "head")
+    context = EvidenceRepository(engine).get_advisor_context("legacy")
+    assert context.target_br == 50
+    assert context.revision == 3
+    assert context.preferred_roles == ()
+    assert context.duplicate_role_penalty == 0
+    engine.dispose()
+
+
+def test_packaged_database_bootstrap_and_0007_upgrade_reach_0008(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unavailable_scripts(*args: object, **kwargs: object) -> None:
+        raise CommandError("Path doesn't exist: migrations")
+
+    legacy_path = tmp_path / "legacy.sqlite"
+    legacy_engine = build_engine(legacy_path)
+    command.upgrade(_alembic_config(legacy_engine), "0007")
+    legacy_engine.dispose()
+    monkeypatch.setattr(storage_db.command, "upgrade", unavailable_scripts)
+
+    for path in (tmp_path / "fresh.sqlite", legacy_path):
+        engine = create_database(path)
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql(
+                "SELECT version_num FROM alembic_version"
+            ).scalar() == "0008"
+        assert {column["name"] for column in inspect(engine).get_columns("advisor_contexts")} >= {
+            "preferred_roles", "duplicate_role_penalty"
+        }
+        engine.dispose()
+
+
+def test_advisor_context_preferences_round_trip_and_legacy_update(database) -> None:
+    _, repository = database
+    repository.create_profile(UserProfile(profile_id="preferences"))
+    initial = repository.get_advisor_context("preferences")
+    assert initial.preferred_roles == ()
+    assert initial.duplicate_role_penalty == 0
+    updated = repository.update_advisor_context(
+        "preferences",
+        selected_preset_id=None,
+        target_br=None,
+        required_vehicle_ids=(),
+        excluded_vehicle_ids=(),
+        expected_revision=0,
+        preferred_roles=(Role.SCOUT, Role.BRAWLER),
+        duplicate_role_penalty=7,
+    )
+    assert updated.preferred_roles == (Role.SCOUT, Role.BRAWLER)
+    assert repository.capture_evaluation_snapshot("preferences").context == updated
+    legacy = repository.update_advisor_context(
+        "preferences",
+        selected_preset_id=None,
+        target_br=50,
+        required_vehicle_ids=(),
+        excluded_vehicle_ids=(),
+        expected_revision=1,
+    )
+    assert legacy.preferred_roles == updated.preferred_roles
+    assert legacy.duplicate_role_penalty == 7
+    assert repository.get_advisor_context("preferences") == legacy
+
+
+@pytest.mark.parametrize("penalty", [-1, 11])
+def test_advisor_context_rejects_out_of_range_penalty(database, penalty: int) -> None:
+    _, repository = database
+    repository.create_profile(UserProfile(profile_id="preferences"))
+    with pytest.raises(ValueError, match="duplicate_role_penalty"):
+        repository.update_advisor_context(
+            "preferences",
+            selected_preset_id=None,
+            target_br=None,
+            required_vehicle_ids=(),
+            excluded_vehicle_ids=(),
+            expected_revision=0,
+            duplicate_role_penalty=penalty,
+        )
+
+
+def test_latest_advisor_snapshot_ignores_other_evaluation_kinds(database) -> None:
+    _, repository = database
+    repository.create_profile(UserProfile(profile_id="snapshots"))
+    assert repository.get_latest_advisor_snapshot("snapshots") is None
+    def store(evaluation_id: str, kind: str) -> None:
+        repository.store_evaluation(
+            evaluation_id=evaluation_id,
+            profile_id="snapshots",
+            kind=kind,
+            profile_revision="0",
+            profile_state={},
+            effective_inputs={},
+            evidence_context={},
+            ruleset_hash="hash",
+            schema_revision="1",
+            result_id=evaluation_id,
+            result_payload={},
+        )
+    store("snapshot-1", "advisor_snapshot")
+    store("evaluation-2", "lineup")
+    store("snapshot-3", "advisor_snapshot")
+    assert repository.get_latest_advisor_snapshot("snapshots").evaluation_id == "snapshot-3"
 
 
 def test_packaged_0005_upgrade_preserves_observations_and_reaches_0006(

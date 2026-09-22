@@ -14,7 +14,7 @@ from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
-from wt_advisor.domain.models import GameMode, Nation, VehicleStatus
+from wt_advisor.domain.models import GameMode, Nation, Role, VehicleStatus
 from wt_advisor.services.advisor import AdvisorService
 
 READ_ONLY = ToolAnnotations(
@@ -81,6 +81,12 @@ def create_server(service: AdvisorService) -> MCPServer[Any]:
         """Return active evidence snapshots and schema/rules revisions."""
 
         return _dump(service.data_status())
+
+    @server.tool(annotations=READ_ONLY, structured_output=True)
+    def get_advisor_snapshot(profile_id: str = "acceptance") -> dict[str, Any]:
+        """Read the already-computed deterministic recommendation and staleness."""
+
+        return _dump(service.get_advisor_snapshot(profile_id))
 
     @server.tool(annotations=REFRESH_MUTATION, structured_output=True)
     def refresh_community_evidence() -> dict[str, Any]:
@@ -260,6 +266,8 @@ def create_server(service: AdvisorService) -> MCPServer[Any]:
         ] = None,
         required_vehicle_ids: list[str] | None = None,
         excluded_vehicle_ids: list[str] | None = None,
+        preferred_roles: list[Role] | None = None,
+        duplicate_role_penalty: Annotated[int | None, Field(ge=0, le=10)] = None,
     ) -> dict[str, Any]:
         """Update the selected preset and saved constrained-generation context."""
 
@@ -271,6 +279,8 @@ def create_server(service: AdvisorService) -> MCPServer[Any]:
                 required_vehicle_ids=tuple(required_vehicle_ids or ()),
                 excluded_vehicle_ids=tuple(excluded_vehicle_ids or ()),
                 expected_revision=expected_revision,
+                preferred_roles=preferred_roles,
+                duplicate_role_penalty=duplicate_role_penalty,
             )
         )
 
