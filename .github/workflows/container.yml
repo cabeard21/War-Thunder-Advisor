@@ -57,8 +57,19 @@ jobs:
           tags: wt-advisor:smoke
       - run: python scripts/container_smoke.py wt-advisor:smoke
 
+  windows-launcher:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m venv .venv
+      - run: .\.venv\Scripts\python.exe -m pip install -e . pytest
+      - run: .\.venv\Scripts\python.exe -m pytest tests/test_tunnel_launcher.py
+
   publish:
-    needs: checks
+    needs: [checks, windows-launcher]
     if: >-
       github.event_name != 'pull_request' &&
       (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) ||

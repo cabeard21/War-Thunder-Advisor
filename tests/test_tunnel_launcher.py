@@ -1,7 +1,10 @@
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
+
+import pytest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
@@ -49,6 +52,7 @@ def test_batch_wrapper_forwards_arguments_to_the_powershell_launcher() -> None:
     assert 'exit /b %ERRORLEVEL%' in wrapper
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="requires Windows PowerShell and cmd.exe")
 def test_launcher_starts_dashboard_then_propagates_tunnel_exit_and_cleans_up(
     tmp_path: Path,
 ) -> None:
@@ -94,6 +98,7 @@ def test_launcher_starts_dashboard_then_propagates_tunnel_exit_and_cleans_up(
         raise AssertionError("dashboard port remained open after the tunnel exited")
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="requires Windows PowerShell and cmd.exe")
 def test_launcher_refuses_an_occupied_dashboard_port(tmp_path: Path) -> None:
     database = tmp_path / "launcher.sqlite"
     database.touch()
