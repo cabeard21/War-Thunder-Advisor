@@ -14,7 +14,13 @@ SQLite is managed by Alembic through revision `0008`. Imported payloads create i
 snapshots and raw artifacts. Metadata, capabilities, resolved availability, identity aliases,
 research graphs, and statistics are independently versioned components. User profiles and vehicle
 statuses are stored separately and revisioned on mutation; alias reconciliation has dry-run,
-optimistic-revision, supersession, and audit records.
+optimistic-revision, supersession, and audit records. Marking a vehicle `owned` also promotes the
+direct successors whose research prerequisites that ownership satisfies from `locked`/`unknown` to
+`available_to_research`, in the same transaction and under one revision bump; the cascade is never
+transitive and never demotes. A cascade entry is advisory: the repository re-checks inside the
+write transaction that the target is known and still unrecorded. Cascade-producing service writes
+also guard the status revision used for derivation, rejecting concurrent changes before any
+promotion is persisted; explicitly supplied revision guards retain their existing behavior.
 
 Re-importing identical content is idempotent. The repository verifies the retained raw artifact's
 size and checksum at its persistence boundary. Overrides resolve on top of imported facts and

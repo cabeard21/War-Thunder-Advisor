@@ -42,6 +42,7 @@ from wt_advisor.data.providers.community_statistics import (
 from wt_advisor.data.providers.fixture import FixtureProvider
 from wt_advisor.data.providers.wt_vehicles_api import WarThunderVehiclesApiProvider
 from wt_advisor.domain.models import (
+    UNRECORDED_STATUSES,
     AcquisitionType,
     AdditionEvaluation,
     AvailabilityType,
@@ -1496,25 +1497,60 @@ class AdvisorService:
             raise ValueError("expected_revision and expected_write_revision are mutually exclusive")
         self._resolve_profile_id(profile_id)
         self._require_vehicle(vehicle_id)
-        before = self._statuses.get(vehicle_id, VehicleStatus.UNKNOWN)
         if self._repository is not None:
-            self._repository.set_vehicle_status(
+            self._statuses = self._repository.get_user_vehicle_states(self._profile.profile_id)
+        before = self._statuses.get(vehicle_id, VehicleStatus.UNKNOWN)
+        projected = {**self._statuses, vehicle_id: status}
+        cascade = self._unblocked_children(vehicle_id, projected)
+        if self._repository is not None:
+            if cascade and expected_revision is None and expected_write_revision is None:
+                # The cascade depends on every prerequisite in this status snapshot.
+                # Reject a concurrent change rather than persist a stale promotion.
+                expected_revision = stable_hash(dict(sorted(self._statuses.items())))
+            stored = self._repository.set_vehicle_status(
                 self._profile.profile_id,
                 vehicle_id,
                 status,
                 expected_revision=expected_revision,
                 expected_write_revision=expected_write_revision,
+                cascade=cascade,
             )
             self._statuses = self._repository.get_user_vehicle_states(self._profile.profile_id)
-        elif before is not status:
-            self._statuses = {**self._statuses, vehicle_id: status}
+            applied = {target: cascade[target] for target in stored.cascaded}
+        else:
+            self._statuses = {**projected, **cascade}
+            applied = cascade
         return VehicleStatusChange(
             profile_id=self._profile.profile_id,
             vehicle_id=vehicle_id,
             before_status=before,
             after_status=status,
             revision=stable_hash(dict(sorted(self._statuses.items()))),
+            cascaded_statuses=applied,
         )
+
+    def _unblocked_children(
+        self, vehicle_id: str, statuses: Mapping[str, VehicleStatus]
+    ) -> dict[str, VehicleStatus]:
+        """Open the successors this ownership change just unblocked, demoting nothing."""
+
+        if statuses.get(vehicle_id) is not VehicleStatus.OWNED or not self._research_edges:
+            return {}
+        prerequisites: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
+        children: set[str] = set()
+        for edge in self._research_edges:
+            parent, child, group, requirement = _research_edge_parts(edge)
+            prerequisites[child].append((parent, group, requirement))
+            if parent == vehicle_id:
+                children.add(child)
+        return {
+            child: VehicleStatus.AVAILABLE_TO_RESEARCH
+            for child in sorted(children)
+            if child in self._vehicles
+            and statuses.get(child, VehicleStatus.UNKNOWN) in UNRECORDED_STATUSES
+            and self._is_normally_researchable(child)
+            and _prerequisites_satisfied(prerequisites[child], dict(statuses))
+        }
 
     def get_profile_write_revision(self, profile_id: str) -> str:
         """Return the persisted monotonic token for an optional guarded write."""

@@ -21,6 +21,7 @@ from wt_advisor.data.models import (
 )
 from wt_advisor.domain.models import (
     BR_LADDER,
+    UNRECORDED_STATUSES,
     AcquisitionType,
     AvailabilityType,
     Capability,
@@ -178,6 +179,7 @@ class VehicleStatusChange:
     after: VehicleStatus
     profile_revision: int
     changed: bool
+    cascaded: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1615,10 +1617,23 @@ class EvidenceRepository:
         status: VehicleStatus | str,
         expected_revision: int | str | None = None,
         expected_write_revision: int | str | None = None,
+        cascade: Mapping[str, VehicleStatus | str] | None = None,
     ) -> VehicleStatusChange:
+        """Write one status, plus any derived cascade, under a single revision bump.
+
+        A cascade entry is advisory: this boundary applies it only to a vehicle it knows
+        whose stored status is still unrecorded, so a status written between the caller's
+        derivation and this transaction always wins.
+        """
+
         if expected_revision is not None and expected_write_revision is not None:
             raise ValueError("expected_revision and expected_write_revision are mutually exclusive")
         normalized_status = status if isinstance(status, VehicleStatus) else VehicleStatus(status)
+        derived = {
+            target: value if isinstance(value, VehicleStatus) else VehicleStatus(value)
+            for target, value in (cascade or {}).items()
+            if target != vehicle_id
+        }
         with self.session() as session:
             profile = session.get(UserProfileRow, profile_id)
             if profile is None:
@@ -1629,6 +1644,10 @@ class EvidenceRepository:
                 raise ValueError("profile write revision changed")
             if session.get(VehicleRow, vehicle_id) is None:
                 raise LookupError(f"unknown vehicle {vehicle_id!r}")
+            known = {
+                target for target in sorted(derived)
+                if session.get(VehicleRow, target) is not None
+            }
             current_statuses = {
                 row.vehicle_id: VehicleStatus(row.status)
                 for row in session.scalars(
@@ -1642,9 +1661,28 @@ class EvidenceRepository:
                 dict(sorted(current_statuses.items()))
             ) != str(expected_revision):
                 raise ValueError("profile revision changed")
-            state = session.get(UserVehicleStateRow, (profile_id, vehicle_id))
-            before = None if state is None else VehicleStatus(state.status)
-            if before is normalized_status:
+            states = {
+                target: session.get(UserVehicleStateRow, (profile_id, target))
+                for target in sorted({vehicle_id, *known})
+            }
+            stored = {
+                target: VehicleStatus(state.status)
+                for target, state in states.items()
+                if state is not None
+            }
+            before = stored.get(vehicle_id)
+            eligible = {
+                target: value
+                for target, value in derived.items()
+                if target in known
+                and stored.get(target, VehicleStatus.UNKNOWN) in UNRECORDED_STATUSES
+            }
+            pending = {
+                target: value
+                for target, value in {**eligible, vehicle_id: normalized_status}.items()
+                if stored.get(target) is not value
+            }
+            if not pending:
                 return VehicleStatusChange(
                     before=before,
                     after=normalized_status,
@@ -1670,17 +1708,19 @@ class EvidenceRepository:
                 raise ValueError("profile revision changed")
             profile.revision = current_revision + 1
             profile.write_revision += 1
-            if state is None:
-                session.add(
-                    UserVehicleStateRow(
-                        profile_id=profile_id,
-                        vehicle_id=vehicle_id,
-                        status=normalized_status.value,
-                        revision=profile.revision,
+            for target in sorted(pending):
+                state = states[target]
+                if state is None:
+                    session.add(
+                        UserVehicleStateRow(
+                            profile_id=profile_id,
+                            vehicle_id=target,
+                            status=pending[target].value,
+                            revision=profile.revision,
+                        )
                     )
-                )
-            else:
-                state.status = normalized_status.value
+                    continue
+                state.status = pending[target].value
                 state.revision = profile.revision
                 state.superseded = False
                 state.superseded_at = None
@@ -1690,6 +1730,7 @@ class EvidenceRepository:
                 after=normalized_status,
                 profile_revision=profile.revision,
                 changed=True,
+                cascaded=tuple(target for target in sorted(pending) if target != vehicle_id),
             )
 
     def get_user_vehicle_states(self, profile_id: str) -> dict[str, VehicleStatus]:

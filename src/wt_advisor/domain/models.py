@@ -125,6 +125,10 @@ class VehicleStatus(StrEnum):
     UNKNOWN = "unknown"
 
 
+UNRECORDED_STATUSES = frozenset({VehicleStatus.LOCKED, VehicleStatus.UNKNOWN})
+"""Statuses a derived cascade may overwrite; anything else is the user's own record."""
+
+
 class Freshness(StrEnum):
     FRESH = "fresh"
     AGING = "aging"
@@ -624,6 +628,7 @@ class VehicleStatusChange(FrozenModel):
     before_status: VehicleStatus
     after_status: VehicleStatus
     revision: str
+    cascaded_statuses: dict[str, VehicleStatus] = Field(default_factory=dict)
 
 
 class ReconciliationItem(FrozenModel):

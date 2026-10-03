@@ -194,13 +194,14 @@ export function AdvisorApp() {
     setBusy(true); setError("");
     try {
       const revision = asRecord(state?.profile).revision;
-      await api.updateStatus(profileId, vehicleId, attemptedStatus, typeof revision === "string" || typeof revision === "number" ? revision : undefined);
+      const saved = await api.updateStatus(profileId, vehicleId, attemptedStatus, typeof revision === "string" || typeof revision === "number" ? revision : undefined);
       setPendingStatuses((old) => {
         const { [vehicleId]: _saved, ...remaining } = old;
         return remaining;
       });
       await refresh();
-      setNotice("Garage status saved; recommendations refreshed.");
+      const unblocked = Object.keys(asRecord(asRecord(saved).cascaded_statuses)).map(vehicleName).sort();
+      setNotice(`Garage status saved; recommendations refreshed.${unblocked.length ? ` Now researchable: ${unblocked.join(", ")}.` : ""}`);
     } catch (caught) {
       if (caught instanceof AdvisorApiError && (caught.code === "conflict" || caught.status === 409)) {
         await refresh();

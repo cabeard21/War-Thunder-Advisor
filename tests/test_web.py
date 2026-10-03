@@ -73,6 +73,9 @@ def test_real_backend_http_workflow_persists_preset_context_and_reports_conflict
         json={"status": "owned", "expected_revision": progress["revision"]},
     )
     assert changed.status_code == 200
+    assert changed.json()["data"]["cascaded_statuses"] == {
+        "us_m4a3_105": "available_to_research"
+    }
     conflict = client.patch(
         "/api/profiles/acceptance/vehicles/us_m3_lee",
         json={"status": "locked", "expected_revision": progress["revision"]},

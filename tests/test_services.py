@@ -1070,3 +1070,135 @@ def test_partial_live_research_graph_ignores_absent_profile_ids(tmp_path: Path) 
 
     assert service.data_status()["active"]["research_graph_available"] is True
     assert service._directly_researchable() == ("us_m3_lee",)
+
+
+def test_owning_a_prerequisite_cascades_children_to_available_to_research() -> None:
+    service = AdvisorService.from_acceptance_fixture()
+    assert service._statuses["us_m4a3_105"] is VehicleStatus.LOCKED
+
+    change = service.set_user_vehicle_status("acceptance", "us_m3_lee", VehicleStatus.OWNED)
+
+    statuses = service.get_user_progress("acceptance").vehicle_statuses
+    assert change.cascaded_statuses == {"us_m4a3_105": VehicleStatus.AVAILABLE_TO_RESEARCH}
+    assert statuses["us_m4a3_105"] is VehicleStatus.AVAILABLE_TO_RESEARCH
+    assert "us_m4a3_105" in service._directly_researchable()
+    assert statuses["us_m4a1"] is VehicleStatus.LOCKED
+
+
+def test_cascade_only_promotes_children_of_a_newly_owned_vehicle() -> None:
+    service = AdvisorService.from_acceptance_fixture()
+
+    change = service.set_user_vehicle_status(
+        "acceptance", "us_m3_lee", VehicleStatus.UNLOCKED_NOT_PURCHASED
+    )
+
+    assert change.cascaded_statuses == {}
+    assert service._statuses["us_m4a3_105"] is VehicleStatus.LOCKED
+
+
+def test_cascade_preserves_statuses_the_user_already_recorded() -> None:
+    service = AdvisorService.from_acceptance_fixture()
+    service._statuses = {**service._statuses, "us_m4a3_105": VehicleStatus.RESEARCHING}
+
+    change = service.set_user_vehicle_status("acceptance", "us_m3_lee", VehicleStatus.OWNED)
+
+    assert change.cascaded_statuses == {}
+    assert service._statuses["us_m4a3_105"] is VehicleStatus.RESEARCHING
+
+
+def test_cascade_waits_for_every_prerequisite_in_an_all_group() -> None:
+    service = AdvisorService.from_acceptance_fixture()
+    service._research_edges = (
+        *service._research_edges,
+        ("us_m2a4_first_tank_div", "us_m4a3_105"),
+    )
+
+    change = service.set_user_vehicle_status("acceptance", "us_m3_lee", VehicleStatus.OWNED)
+
+    assert change.cascaded_statuses == {}
+    assert service._statuses["us_m4a3_105"] is VehicleStatus.LOCKED
+
+
+def test_cascade_skips_children_that_are_not_normally_researchable() -> None:
+    service = AdvisorService.from_acceptance_fixture()
+    service._resolved_availability = {
+        "us_m4a3_105": ResolvedAvailability(
+            vehicle_id="us_m4a3_105",
+            acquisition_type=AcquisitionType.PACK,
+            researchability=Researchability.NON_RESEARCHABLE,
+            tree_membership=TreeMembership.UNKNOWN,
+            visibility=Visibility.UNKNOWN,
+            source_snapshot_id="availability-test",
+            source_provider="test",
+            source_reference="test-record",
+            reason="pack vehicle",
+        )
+    }
+
+    change = service.set_user_vehicle_status("acceptance", "us_m3_lee", VehicleStatus.OWNED)
+
+    assert change.cascaded_statuses == {}
+    assert service._statuses["us_m4a3_105"] is VehicleStatus.LOCKED
+
+
+def test_persisted_cascade_survives_reopening_and_bumps_one_revision(tmp_path: Path) -> None:
+    database = tmp_path / "advisor.sqlite"
+    service = AdvisorService.from_database(database)
+    before = service.get_user_progress("acceptance")
+
+    change = service.set_user_vehicle_status(
+        "acceptance", "us_m3_lee", VehicleStatus.OWNED, expected_revision=before.revision
+    )
+    repeated = service.set_user_vehicle_status("acceptance", "us_m3_lee", VehicleStatus.OWNED)
+
+    assert change.cascaded_statuses == {"us_m4a3_105": VehicleStatus.AVAILABLE_TO_RESEARCH}
+    assert repeated.cascaded_statuses == {}
+    assert repeated.revision == change.revision
+    statuses = AdvisorService.from_database(database).get_user_progress(
+        "acceptance"
+    ).vehicle_statuses
+    assert statuses["us_m4a3_105"] is VehicleStatus.AVAILABLE_TO_RESEARCH
+
+
+def test_cascade_respects_statuses_written_by_another_session(tmp_path: Path) -> None:
+    database = tmp_path / "advisor.sqlite"
+    stale = AdvisorService.from_database(database)
+    other = AdvisorService.from_database(database)
+    other.set_user_vehicle_status("acceptance", "us_m4a3_105", VehicleStatus.RESEARCHING)
+
+    change = stale.set_user_vehicle_status("acceptance", "us_m3_lee", VehicleStatus.OWNED)
+
+    statuses = stale.get_user_progress("acceptance").vehicle_statuses
+    assert change.cascaded_statuses == {}
+    assert statuses["us_m4a3_105"] is VehicleStatus.RESEARCHING
+
+
+def test_cascade_rejects_prerequisite_changes_during_derivation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "advisor.sqlite"
+    service = AdvisorService.from_database(database)
+    other = AdvisorService.from_database(database)
+    prerequisite = "us_m2a4_first_tank_div"
+    other.set_user_vehicle_status("acceptance", prerequisite, VehicleStatus.OWNED)
+    service._research_edges = (
+        *service._research_edges,
+        (prerequisite, "us_m4a3_105"),
+    )
+    repository = service._repository
+    assert repository is not None
+    original_write = repository.set_vehicle_status
+
+    def write_after_prerequisite_change(*args, **kwargs):
+        other.set_user_vehicle_status("acceptance", prerequisite, VehicleStatus.LOCKED)
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(repository, "set_vehicle_status", write_after_prerequisite_change)
+
+    with pytest.raises(ValueError, match="profile revision changed"):
+        service.set_user_vehicle_status("acceptance", "us_m3_lee", VehicleStatus.OWNED)
+
+    statuses = other.get_user_progress("acceptance").vehicle_statuses
+    assert statuses[prerequisite] is VehicleStatus.LOCKED
+    assert statuses["us_m4a3_105"] is VehicleStatus.LOCKED
+    assert statuses["us_m3_lee"] is not VehicleStatus.OWNED

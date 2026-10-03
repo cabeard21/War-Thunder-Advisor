@@ -366,4 +366,24 @@ describe("field console", () => {
     await waitFor(() => expect(api.updateStatus).toHaveBeenLastCalledWith("acceptance", "m3", "researching", 2));
     await waitFor(() => expect(screen.queryByRole("button", { name: "Retry status for M3 Lee" })).not.toBeInTheDocument());
   });
+
+  it("names the vehicles a garage change just made researchable", async () => {
+    vi.mocked(api.dashboard).mockResolvedValue({
+      profile: { crew_slots: 2, revision: 1 }, context: { revision: "1" }, presets: [], play_now: {},
+      vehicles: [
+        { vehicle_id: "m3", name: "M3 Lee", status: "owned", battle_rating: 27 },
+        { vehicle_id: "m4a3_105", name: "M4A3 (105)", status: "available_to_research", battle_rating: 33 },
+      ],
+    });
+    vi.mocked(api.updateStatus).mockResolvedValueOnce({
+      cascaded_statuses: { m4a3_105: "available_to_research" },
+    });
+
+    render(<AdvisorApp />);
+    fireEvent.change(await screen.findByRole("combobox", { name: "Status for M3 Lee" }), { target: { value: "owned" } });
+
+    await waitFor(() => expect(screen.getAllByRole("status").some((item) =>
+      /Now researchable: M4A3 \(105\)/.test(item.textContent ?? ""),
+    )).toBe(true));
+  });
 });

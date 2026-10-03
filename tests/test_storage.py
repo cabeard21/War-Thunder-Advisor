@@ -1091,3 +1091,115 @@ def test_alembic_0006_upgrade_preserves_populated_snapshot_references(
             "SELECT kill_target_definition FROM vehicle_statistics"
         ).scalar() == "all_targets"
     engine.dispose()
+
+
+def test_cascaded_status_writes_apply_atomically_under_one_revision(
+    database: tuple[Engine, EvidenceRepository],
+) -> None:
+    _, repository = database
+    child = Vehicle(
+        vehicle_id="us_m4a3_105",
+        source_vehicle_id="us_m4a3_105_source",
+        name="M4A3 (105)",
+        nation=Nation.USA,
+        vehicle_class=VehicleClass.MEDIUM_TANK,
+        rank=3,
+        research_parent_id="us_m3_lee",
+        research_cost=21_000,
+        purchase_cost=72_000,
+        capabilities=frozenset({Capability.SMOKE}),
+    )
+    repository.import_vehicle_snapshot(
+        snapshot("vehicles-cascade", DatasetType.VEHICLE_METADATA, b"vehicles"),
+        [m3_lee(), child],
+        raw_content=b"vehicles",
+    )
+    repository.create_profile(UserProfile(profile_id="default"))
+    repository.set_vehicle_status("default", "us_m4a3_105", VehicleStatus.LOCKED)
+    baseline = repository.get_profile("default")
+    assert baseline is not None
+
+    applied = repository.set_vehicle_status(
+        "default",
+        "us_m3_lee",
+        VehicleStatus.OWNED,
+        cascade={"us_m4a3_105": VehicleStatus.AVAILABLE_TO_RESEARCH},
+    )
+    repeated = repository.set_vehicle_status(
+        "default",
+        "us_m3_lee",
+        VehicleStatus.OWNED,
+        cascade={"us_m4a3_105": VehicleStatus.AVAILABLE_TO_RESEARCH},
+    )
+
+    assert applied.changed is True
+    assert applied.cascaded == ("us_m4a3_105",)
+    assert applied.profile_revision == baseline.revision + 1
+    assert repeated.changed is False
+    assert repeated.cascaded == ()
+    assert repeated.profile_revision == applied.profile_revision
+    states = repository.get_user_vehicle_states("default")
+    assert states["us_m3_lee"] is VehicleStatus.OWNED
+    assert states["us_m4a3_105"] is VehicleStatus.AVAILABLE_TO_RESEARCH
+
+
+def test_cascade_skips_unknown_vehicles_without_losing_the_primary_write(
+    database: tuple[Engine, EvidenceRepository],
+) -> None:
+    _, repository = database
+    repository.import_vehicle_snapshot(
+        snapshot("vehicles-cascade-unknown", DatasetType.VEHICLE_METADATA, b"vehicles"),
+        [m3_lee()],
+        raw_content=b"vehicles",
+    )
+    repository.create_profile(UserProfile(profile_id="default"))
+
+    applied = repository.set_vehicle_status(
+        "default",
+        "us_m3_lee",
+        VehicleStatus.OWNED,
+        cascade={"us_ghost": VehicleStatus.AVAILABLE_TO_RESEARCH},
+    )
+
+    assert applied.cascaded == ()
+    assert repository.get_user_vehicle_states("default") == {"us_m3_lee": VehicleStatus.OWNED}
+
+    with pytest.raises(LookupError, match="us_ghost"):
+        repository.set_vehicle_status("default", "us_ghost", VehicleStatus.OWNED)
+
+
+def test_cascade_never_overwrites_a_status_recorded_inside_the_write_window(
+    database: tuple[Engine, EvidenceRepository],
+) -> None:
+    _, repository = database
+    child = Vehicle(
+        vehicle_id="us_m4a3_105",
+        source_vehicle_id="us_m4a3_105_source",
+        name="M4A3 (105)",
+        nation=Nation.USA,
+        vehicle_class=VehicleClass.MEDIUM_TANK,
+        rank=3,
+        research_parent_id="us_m3_lee",
+        research_cost=21_000,
+        purchase_cost=72_000,
+        capabilities=frozenset({Capability.SMOKE}),
+    )
+    repository.import_vehicle_snapshot(
+        snapshot("vehicles-cascade-window", DatasetType.VEHICLE_METADATA, b"vehicles"),
+        [m3_lee(), child],
+        raw_content=b"vehicles",
+    )
+    repository.create_profile(UserProfile(profile_id="default"))
+    repository.set_vehicle_status("default", "us_m4a3_105", VehicleStatus.RESEARCHING)
+
+    applied = repository.set_vehicle_status(
+        "default",
+        "us_m3_lee",
+        VehicleStatus.OWNED,
+        cascade={"us_m4a3_105": VehicleStatus.AVAILABLE_TO_RESEARCH},
+    )
+
+    assert applied.cascaded == ()
+    states = repository.get_user_vehicle_states("default")
+    assert states["us_m3_lee"] is VehicleStatus.OWNED
+    assert states["us_m4a3_105"] is VehicleStatus.RESEARCHING
