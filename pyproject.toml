@@ -62,6 +62,7 @@ target-version = "py311"
 select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
 
 [tool.mypy]
+mypy_path = "$MYPY_CONFIG_FILE_DIR/src"
 python_version = "3.11"
 strict = true
 packages = ["wt_advisor"]
