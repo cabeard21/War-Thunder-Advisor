@@ -18,7 +18,8 @@ COPY pyproject.toml README.md alembic.ini ./
 COPY src/ ./src/
 COPY migrations/ ./migrations/
 COPY --from=frontend /build/src/wt_advisor/web/static/ ./src/wt_advisor/web/static/
-RUN pip install --no-cache-dir . \
+RUN pip install --no-cache-dir --upgrade "setuptools>=83" \
+    && pip install --no-cache-dir . \
     && groupadd --gid 10001 advisor \
     && useradd --uid 10001 --gid advisor --no-create-home advisor \
     && mkdir /data && chown advisor:advisor /data
