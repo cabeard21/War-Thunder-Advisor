@@ -41,10 +41,14 @@ async function startServer() {
   await waitForServer();
 }
 
-function stopServer() {
-  if (!server?.pid) return;
-  if (process.platform === "win32") spawnSync("taskkill", ["/pid", String(server.pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
-  else server.kill("SIGTERM");
+async function stopServer() {
+  const running = server;
+  if (!running?.pid) return;
+  if (process.platform === "win32") spawnSync("taskkill", ["/pid", String(running.pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
+  else running.kill("SIGTERM");
+  await expect.poll(() => running.exitCode !== null || running.signalCode !== null, {
+    timeout: 20_000,
+  }).toBe(true);
   server = undefined;
 }
 
@@ -58,8 +62,8 @@ async function api(pathname: string, init?: RequestInit) {
 }
 
 test.beforeAll(startServer);
-test.afterAll(() => {
-  stopServer();
+test.afterAll(async () => {
+  await stopServer();
   rmSync(runDir, { recursive: true, force: true });
 });
 
@@ -148,7 +152,7 @@ test("complete dashboard workflow survives conflicts and an actual process resta
   await page.getByRole("button", { name: new RegExp(`Retry status for`) }).click();
   await expect(page.getByRole("button", { name: new RegExp(`Retry status for`) })).toHaveCount(0);
 
-  stopServer();
+  await stopServer();
   await startServer();
   await page.reload();
   await expect(page.getByText("Restart lineup renamed", { exact: true })).toBeVisible();
