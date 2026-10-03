@@ -16,6 +16,9 @@ python -m venv .venv
 The acceptance fixture is deliberately frozen and network-free. Live provider refreshes create
 new immutable snapshots but are not required to run tests.
 
+For the ARM64 production image, private LAN/Tailscale Compose configuration, persistent
+SQLite storage, and upgrade steps, see [deployment.md](docs/deployment.md).
+
 ## Usage
 
 ```powershell
@@ -106,6 +109,8 @@ would change it. See [docs/architecture.md](docs/architecture.md) for the full s
 The dashboard is packaged with the Python distribution; it does not need Vite at runtime.
 For frontend development and rebuilding its assets, use Node.js 22.22.2 (the supported range is
 `^22.22.2`).
-It is loopback-only and is never exposed through the MCP tunnel. Saved presets are not garage
+Local startup is loopback-only by default; private container access requires the explicit
+configuration in [deployment.md](docs/deployment.md). The dashboard is never exposed through
+the MCP tunnel. Saved presets are not garage
 ownership; hypothetical analysis never changes vehicle state. Refresh after a revision conflict.
 The community refresh button reports source failures briefly and does not alter stored evaluations.

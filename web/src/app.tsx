@@ -60,6 +60,8 @@ export function AdvisorApp() {
   const [presetName, setPresetName] = useState("");
   const [editingPreset, setEditingPreset] = useState<Preset>();
   const [pendingStatuses, setPendingStatuses] = useState<Record<string, string>>({});
+  const [savingStatuses, setSavingStatuses] = useState<Record<string, boolean>>({});
+  const savingStatusesRef = useRef<Record<string, boolean>>({});
   const [lastEvaluatedLineup, setLastEvaluatedLineup] = useState<string[]>([]);
   const [communityRefresh, setCommunityRefresh] = useState<CommunityRefreshResult>();
   const [advisor, setAdvisor] = useState<AdvisorSnapshotState>();
@@ -190,6 +192,9 @@ export function AdvisorApp() {
     setState((old) => old ? { ...old, context: context as DashboardState["context"] } : old);
   }, "Selected preset saved as the active context.");
   const saveStatus = async (vehicleId: string, attemptedStatus: string) => {
+    if (savingStatusesRef.current[vehicleId]) return;
+    savingStatusesRef.current = { ...savingStatusesRef.current, [vehicleId]: true };
+    setSavingStatuses(savingStatusesRef.current);
     setPendingStatuses((old) => ({ ...old, [vehicleId]: attemptedStatus }));
     setBusy(true); setError("");
     try {
@@ -207,7 +212,12 @@ export function AdvisorApp() {
         await refresh();
       }
       setError(displayError(caught));
-    } finally { setBusy(false); }
+    } finally {
+      const { [vehicleId]: _finished, ...remaining } = savingStatusesRef.current;
+      savingStatusesRef.current = remaining;
+      setSavingStatuses(remaining);
+      setBusy(false);
+    }
   };
   const savePreset = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -246,8 +256,8 @@ export function AdvisorApp() {
       <section className="panel garage"><div className="panel-title"><div><p className="eyebrow">GARAGE</p><h2>Progression status</h2></div><input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter vehicles" aria-label="Filter vehicles" /></div>
         <div className="vehicle-list">{vehicles.map((vehicle) => <article className="vehicle" key={vehicle.vehicle_id}>
           <div><strong>{title(vehicle)}</strong><small>BR {br(vehicle.battle_rating)} · {vehicle.vehicle_class ?? "unknown class"}</small></div>
-          <select aria-label={`Status for ${title(vehicle)}`} value={pendingStatuses[vehicle.vehicle_id] ?? vehicle.status ?? "unknown"} onChange={(e) => void saveStatus(vehicle.vehicle_id, e.target.value)}>{statuses.map((status) => <option key={status}>{status}</option>)}</select>
-          {pendingStatuses[vehicle.vehicle_id] && pendingStatuses[vehicle.vehicle_id] !== vehicle.status && <button aria-label={`Retry status for ${title(vehicle)}`} onClick={() => void saveStatus(vehicle.vehicle_id, pendingStatuses[vehicle.vehicle_id])}>Retry</button>}
+          <select aria-label={`Status for ${title(vehicle)}`} disabled={savingStatuses[vehicle.vehicle_id]} value={pendingStatuses[vehicle.vehicle_id] ?? vehicle.status ?? "unknown"} onChange={(e) => void saveStatus(vehicle.vehicle_id, e.target.value)}>{statuses.map((status) => <option key={status}>{status}</option>)}</select>
+          {pendingStatuses[vehicle.vehicle_id] && pendingStatuses[vehicle.vehicle_id] !== vehicle.status && <button aria-label={`Retry status for ${title(vehicle)}`} disabled={savingStatuses[vehicle.vehicle_id]} onClick={() => void saveStatus(vehicle.vehicle_id, pendingStatuses[vehicle.vehicle_id])}>Retry</button>}
           <button aria-pressed={draft.includes(vehicle.vehicle_id)} onClick={() => toggle(vehicle.vehicle_id)}>{draft.includes(vehicle.vehicle_id) ? "Remove" : "Draft"}</button>
           <button className={required.includes(vehicle.vehicle_id) ? "marked" : ""} onClick={() => toggleConstraint(vehicle.vehicle_id, "required")}>Pin</button>
           <button className={excluded.includes(vehicle.vehicle_id) ? "marked" : ""} onClick={() => toggleConstraint(vehicle.vehicle_id, "excluded")}>Exclude</button>

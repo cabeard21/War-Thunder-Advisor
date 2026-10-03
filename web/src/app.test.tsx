@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AdvisorApp } from "./app";
 import { api, AdvisorApiError } from "./api";
@@ -362,9 +362,44 @@ describe("field console", () => {
     expect(status).toHaveValue("researching");
     expect(api.updateStatus).toHaveBeenLastCalledWith("acceptance", "m3", "researching", 1);
 
+    await waitFor(() => expect(retry).toBeEnabled());
     fireEvent.click(retry);
     await waitFor(() => expect(api.updateStatus).toHaveBeenLastCalledWith("acceptance", "m3", "researching", 2));
     await waitFor(() => expect(screen.queryByRole("button", { name: "Retry status for M3 Lee" })).not.toBeInTheDocument());
+  });
+
+  it("blocks duplicate status submissions until the conflict refresh completes", async () => {
+    const dashboard = { profile: { crew_slots: 2, revision: 1 }, context: {}, vehicles: [{ vehicle_id: "m3", name: "M3 Lee", status: "owned" }], presets: [] };
+    let finishRefresh!: (value: typeof dashboard) => void;
+    const conflictRefresh = new Promise<typeof dashboard>((resolve) => { finishRefresh = resolve; });
+    vi.mocked(api.dashboard)
+      .mockResolvedValueOnce(dashboard)
+      .mockImplementationOnce(() => conflictRefresh)
+      .mockResolvedValueOnce({ ...dashboard, profile: { ...dashboard.profile, revision: 3 }, vehicles: [{ ...dashboard.vehicles[0], status: "researching" }] });
+    vi.mocked(api.updateStatus)
+      .mockRejectedValueOnce(new AdvisorApiError({ code: "conflict", message: "Refresh before saving.", status: 409 }))
+      .mockResolvedValueOnce({});
+
+    render(<AdvisorApp />);
+    const status = await screen.findByRole("combobox", { name: "Status for M3 Lee" });
+    fireEvent.change(status, { target: { value: "researching" } });
+    const retry = await screen.findByRole("button", { name: "Retry status for M3 Lee" });
+    await waitFor(() => expect(api.dashboard).toHaveBeenCalledTimes(2));
+    expect(status).toBeDisabled();
+    expect(retry).toBeDisabled();
+    fireEvent.click(retry);
+    // Synthetic changes bypass disabled controls, so the handler must also guard.
+    fireEvent.change(status, { target: { value: "locked" } });
+    expect(api.updateStatus).toHaveBeenCalledTimes(1);
+    expect(status).toHaveValue("researching");
+
+    await act(async () => { finishRefresh({ ...dashboard, profile: { ...dashboard.profile, revision: 2 } }); });
+    await waitFor(() => expect(retry).toBeEnabled());
+    expect(status).toHaveValue("researching");
+    fireEvent.click(retry);
+    await waitFor(() => expect(api.updateStatus).toHaveBeenLastCalledWith("acceptance", "m3", "researching", 2));
+    await waitFor(() => expect(status).toBeEnabled());
+    expect(screen.queryByRole("button", { name: "Retry status for M3 Lee" })).not.toBeInTheDocument();
   });
 
   it("names the vehicles a garage change just made researchable", async () => {

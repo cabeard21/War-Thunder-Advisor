@@ -198,17 +198,11 @@ All tools except the idempotent profile mutation are annotated read-only. Struct
 
 ## Test coverage status
 
-`pyproject.toml` enforces `fail_under = 80`, which applies to **line** coverage; the suite passes
-that comfortably (91.61%).
-
-`scripts/check_coverage.py` is a stricter standalone tool that checks line and branch coverage
-independently against the same threshold. Its **branch** check currently fails: 78.35% against an
-80% target. This is a pre-existing condition, not a regression — branch coverage measured without
-the bounded-preference work is 77.92%, so that change raised it by 0.43 points. The shortfall is
-spread across older modules (`services/advisor.py` 70.3%, `storage/repository.py` 71.1%,
-`storage/db.py` 42.9%). The script is not wired into any CI or build step; there is no `.github/`
-workflow in the repository. Closing the gap is tracked as separate work rather than papered over
-with tests written only to move the number.
+`pyproject.toml` enforces `fail_under = 80` on the combined coverage report. CI additionally
+runs `scripts/check_coverage.py`, requiring line and branch coverage independently to reach
+80%. Python tests, lint/type checks, frontend unit/type/build checks, browser tests, and an
+ARM64 container smoke test gate publication of pinned GHCR images. See
+[deployment.md](deployment.md) for the runtime contract and private Compose example.
 
 ## Local security boundary
 
@@ -217,4 +211,6 @@ the configured local address (`127.0.0.1` by default) without authentication; it
 not intended for public exposure. Inputs are schema-validated, SQL is parameterized
 through SQLAlchemy, import sizes and HTTP timeouts are bounded, and secrets are neither
 required nor stored. Live imports are explicit operations; normal tests and acceptance
-runs are network-free.
+runs are network-free. Private containers explicitly opt into a non-loopback bind with an
+exact allowed-host list, retaining same-origin write protection. This is a LAN/Tailscale
+deployment boundary, not public authentication.

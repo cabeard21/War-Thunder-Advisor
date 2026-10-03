@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import Mapping, Sequence
 from dataclasses import fields, is_dataclass
 from datetime import date, datetime
@@ -16,6 +15,7 @@ import uvicorn
 from pydantic import BaseModel
 
 from wt_advisor.domain.models import GameMode, Nation, Role, SnapshotPurpose, VehicleStatus
+from wt_advisor.runtime import RuntimeSettings, database_path
 from wt_advisor.services.acceptance import (
     build_acceptance_report,
     build_m2_acceptance_report,
@@ -64,8 +64,7 @@ class _MilestoneTwoService(Protocol):
 
 
 def _default_service() -> AdvisorService:
-    database = Path(os.environ.get("WT_ADVISOR_DB", "wt-advisor.sqlite"))
-    return AdvisorService.from_database(database)
+    return AdvisorService.from_database(database_path())
 
 
 def _jsonable(value: Any) -> Any:
@@ -124,11 +123,18 @@ def create_app(service: AdvisorService | None = None) -> typer.Typer:
     root.add_typer(advisor_snapshot, name="advisor")
 
     @root.command("dashboard")
-    def dashboard(port: Annotated[int, typer.Option(min=1024, max=65535)] = 8765) -> None:
-        """Serve the bundled local dashboard on loopback only."""
+    def dashboard(port: Annotated[int | None, typer.Option(min=1024, max=65535)] = None) -> None:
+        """Serve the dashboard locally, or with explicitly configured private access."""
         from wt_advisor.web.app import create_app as create_web_app
 
-        uvicorn.run(create_web_app(advisor()), host="127.0.0.1", port=port)
+        try:
+            settings = RuntimeSettings.from_environment(port=port)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        uvicorn.run(
+            create_web_app(advisor(), settings=settings), host=settings.bind_address,
+            port=settings.port, proxy_headers=False,
+        )
 
     resolved_service: AdvisorService | None = service
 

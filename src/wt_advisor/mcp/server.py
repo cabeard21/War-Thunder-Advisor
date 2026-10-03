@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
 from datetime import date, datetime
 from enum import Enum
-from pathlib import Path
 from typing import Annotated, Any
 
 from mcp.server import MCPServer
@@ -15,6 +13,7 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from wt_advisor.domain.models import GameMode, Nation, Role, VehicleStatus
+from wt_advisor.runtime import database_path
 from wt_advisor.services.advisor import AdvisorService
 
 READ_ONLY = ToolAnnotations(
@@ -352,8 +351,7 @@ def create_server(service: AdvisorService) -> MCPServer[Any]:
 
 
 def main() -> None:
-    database = Path(os.environ.get("WT_ADVISOR_DB", "wt-advisor.sqlite"))
-    create_server(AdvisorService.from_database(database)).run("stdio")
+    create_server(AdvisorService.from_database(database_path())).run("stdio")
 
 
 if __name__ == "__main__":

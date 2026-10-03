@@ -13,6 +13,12 @@ dist/
 *.db
 *.sqlite
 *.sqlite3
+*.db-*
+*.sqlite-*
+*.sqlite3-*
+*.bak
+*.backup
+coverage.json
 before-live-import.json
 live-import.json
 live-*.json

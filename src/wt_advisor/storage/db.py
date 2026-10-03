@@ -123,19 +123,26 @@ def _upgrade_packaged_0007_to_0008(connection: Connection) -> None:
     """Apply advisor preference delta when migration scripts are absent."""
 
     operations = Operations(MigrationContext.configure(connection))
-    operations.add_column(
-        "advisor_contexts",
-        Column("preferred_roles", JSON(), nullable=False, server_default="[]"),
-    )
-    operations.add_column(
-        "advisor_contexts",
-        Column("duplicate_role_penalty", Integer(), nullable=False, server_default="0"),
-    )
-    operations.create_index(
-        "ix_stored_evaluations_profile_kind_created",
-        "stored_evaluations",
-        ["profile_id", "kind", "created_at"],
-    )
+    # The 0004 wheel fallback creates new tables from current models, which already
+    # include these fields and index. Existing 0007 databases still need the delta.
+    columns = {column["name"] for column in inspect(connection).get_columns("advisor_contexts")}
+    if "preferred_roles" not in columns:
+        operations.add_column(
+            "advisor_contexts",
+            Column("preferred_roles", JSON(), nullable=False, server_default="[]"),
+        )
+    if "duplicate_role_penalty" not in columns:
+        operations.add_column(
+            "advisor_contexts",
+            Column("duplicate_role_penalty", Integer(), nullable=False, server_default="0"),
+        )
+    indexes = {index["name"] for index in inspect(connection).get_indexes("stored_evaluations")}
+    if "ix_stored_evaluations_profile_kind_created" not in indexes:
+        operations.create_index(
+            "ix_stored_evaluations_profile_kind_created",
+            "stored_evaluations",
+            ["profile_id", "kind", "created_at"],
+        )
     connection.execute(
         text("UPDATE alembic_version SET version_num = '0008' WHERE version_num = '0007'")
     )

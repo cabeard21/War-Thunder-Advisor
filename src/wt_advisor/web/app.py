@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from threading import Lock
@@ -14,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from wt_advisor.domain.models import Role, VehicleStatus
+from wt_advisor.runtime import RuntimeSettings, authority_host
 from wt_advisor.services.advisor import AdvisorService
 
 LOGGER = logging.getLogger(__name__)
@@ -51,11 +51,12 @@ def _dump(value: Any) -> Any:
     )
 
 
-def create_app(service: AdvisorService | None = None) -> FastAPI:
+def create_app(
+    service: AdvisorService | None = None, *, settings: RuntimeSettings | None = None,
+) -> FastAPI:
+    settings = settings or RuntimeSettings.from_environment()
     app = FastAPI(title="War Thunder Advisor", docs_url=None, redoc_url=None)
-    resolved = service or AdvisorService.from_database(
-        Path(os.environ.get("WT_ADVISOR_DB", "wt-advisor.sqlite"))
-    )
+    resolved = service or AdvisorService.from_database(settings.database)
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="advisor-refresh")
     refreshes: dict[str, Future[dict[str, Any]]] = {}
     refresh_lock = Lock()
@@ -116,32 +117,41 @@ def create_app(service: AdvisorService | None = None) -> FastAPI:
         )
 
     @app.middleware("http")
-    async def local_only(request: Request, call_next: Any) -> Any:
-        host = request.headers.get("host", "").split(":")[0]
-        if host not in {"127.0.0.1", "localhost", "testserver"}:
+    async def private_only(request: Request, call_next: Any) -> Any:
+        try:
+            host = authority_host(request.headers.get("host", ""))
+        except ValueError:
+            host = ""
+        if host not in settings.allowed_hosts:
             return JSONResponse(
                 status_code=400,
                 content={
                     "error": {
                         "code": "host_rejected",
-                        "message": "loopback host required",
+                        "message": "configured dashboard host required",
                         "details": {},
                     }
                 },
             )
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             origin = request.headers.get("origin")
-            parsed_origin = urlsplit(origin) if origin else None
+            try:
+                parsed_origin = urlsplit(origin) if origin else None
+                if parsed_origin is not None:
+                    _ = parsed_origin.port
+            except ValueError:
+                parsed_origin = None
             request_authority = request.headers.get("host", "").lower()
             origin_authority = parsed_origin.netloc.lower() if parsed_origin else None
             if (
                 (origin and (
                     parsed_origin is None
-                    or parsed_origin.scheme != request.url.scheme
+                    or parsed_origin.scheme != request.scope["scheme"]
                     or origin_authority != request_authority
                     or parsed_origin.path not in {"", "/"}
                     or parsed_origin.query
                     or parsed_origin.fragment
+                    or any(character.isspace() for character in origin)
                 ))
                 or request.headers.get("sec-fetch-site") == "cross-site"
             ):
@@ -159,6 +169,12 @@ def create_app(service: AdvisorService | None = None) -> FastAPI:
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         return response
+
+    @app.get("/health")
+    def health() -> dict[str, str]:
+        # Initialization has opened/migrated the database. This probe deliberately avoids
+        # provider requests and expensive advisor calculations.
+        return {"status": "ok"}
 
     @app.get("/api/data-status")
     def data_status() -> dict[str, Any]:
